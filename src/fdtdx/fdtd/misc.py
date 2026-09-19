@@ -11,6 +11,7 @@ def collect_boundary_interfaces(
     arrays: ArrayContainer,
     pml_objects: Sequence[PerfectlyMatchedLayer],
     fields_to_collect: Sequence[str] = ("E", "H"),
+    width: int = 1,
 ) -> dict[str, jax.Array]:
     """Collects field values at PML boundary interfaces.
 
@@ -22,6 +23,8 @@ def collect_boundary_interfaces(
         arrays (ArrayContainer): Container holding the field arrays (E, H fields)
         pml_objects (Sequence[PerfectlyMatchedLayer]): Sequence of PML objects defining boundary regions
         fields_to_collect (Sequence[str], optional): Which fields to collect values for (default: E and H fields)
+        width (int, optional): Thickness of the interface slab in cells (``2r - 1`` for a curl stencil
+            with ``r`` taps per side). Defaults to 1.
 
     Returns:
         dict[str, jax.Array]: Dictionary mapping "{pml_name}_{field_str}" to array of interface field values
@@ -30,7 +33,7 @@ def collect_boundary_interfaces(
     for field_str in fields_to_collect:
         arr: jax.Array = getattr(arrays.fields, field_str)
         for pml in pml_objects:
-            cur_slice = arr[:, *pml.interface_slice()]
+            cur_slice = arr[:, *pml.interface_slice(width)]
             res[f"{pml.name}_{field_str}"] = cur_slice
     return res
 
@@ -40,6 +43,7 @@ def add_boundary_interfaces(
     values: dict[str, jax.Array],
     pml_objects: Sequence[PerfectlyMatchedLayer],
     fields_to_add: Sequence[str] = ("E", "H"),
+    width: int = 1,
 ) -> ArrayContainer:
     """Adds saved field values back to PML boundary interfaces.
 
@@ -52,6 +56,8 @@ def add_boundary_interfaces(
         values (dict[str, jax.Array]): Dictionary of saved interface values from collect_boundary_interfaces()
         pml_objects (Sequence[PerfectlyMatchedLayer]): Sequence of PML objects defining boundary regions
         fields_to_add (Sequence[str], optional): Which fields to restore values for (default: E and H fields)
+        width (int, optional): Thickness of the interface slab in cells. Must match the width used when
+            collecting. Defaults to 1.
 
     Returns:
         ArrayContainer: Updated ArrayContainer with restored interface field values
@@ -60,7 +66,7 @@ def add_boundary_interfaces(
         arr: jax.Array = getattr(arrays.fields, field_str)
         for pml in pml_objects:
             val = values[f"{pml.name}_{field_str}"]
-            arr = arr.at[:, *pml.interface_slice()].set(val)
+            arr = arr.at[:, *pml.interface_slice(width)].set(val)
         arrays = arrays.aset(f"fields->{field_str}", arr)
 
     return arrays

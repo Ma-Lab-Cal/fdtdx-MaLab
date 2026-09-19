@@ -615,27 +615,35 @@ def expand_to_3x3(arr: jax.Array | float | None) -> jax.Array | None:
 def pad_fields(
     fields: jax.Array,
     periodic_axes: tuple[bool, bool, bool],
+    width: int = 1,
 ) -> jax.Array:
     """Pads fields for boundary conditions.
 
     Args:
         fields (jax.Array): Fields to pad (3, Nx, Ny, Nz) for each field component
         periodic_axes (tuple[bool, bool, bool]): Tuple of booleans indicating which axes use periodic boundaries
+        width (int): Number of ghost cells added on every face of every axis. The curl stencil of
+            order ``2r`` needs ``width = r``. Defaults to 1 (the classic Yee scheme).
 
     Returns:
-        jax.Array: Padded fields (3, Nx+2, Ny+2, Nz+2) with boundary conditions applied
+        jax.Array: Padded fields (3, Nx+2w, Ny+2w, Nz+2w) with boundary conditions applied
+
+    Raises:
+        ValueError: If ``width`` is smaller than one.
     """
+    if width < 1:
+        raise ValueError(f"pad_fields width must be >= 1, got {width}")
     padded_fields = fields
 
     for i, periodic in enumerate(periodic_axes):
         pad_mode = "wrap" if periodic else "constant"
         # Create padding tuple for current axis
         if i == 0:
-            pad_width = ((0, 0), (1, 1), (0, 0), (0, 0))
+            pad_width = ((0, 0), (width, width), (0, 0), (0, 0))
         elif i == 1:
-            pad_width = ((0, 0), (0, 0), (1, 1), (0, 0))
+            pad_width = ((0, 0), (0, 0), (width, width), (0, 0))
         else:  # i == 2
-            pad_width = ((0, 0), (0, 0), (0, 0), (1, 1))
+            pad_width = ((0, 0), (0, 0), (0, 0), (width, width))
         padded_fields = jnp.pad(padded_fields, pad_width, mode=pad_mode)
 
     return padded_fields

@@ -4,6 +4,7 @@ from typing import Literal
 import jax
 
 from fdtdx.core.jax.pytrees import autoinit, frozen_field, frozen_private_field
+from fdtdx.core.physics.symmetry import fill_image_halo
 from fdtdx.objects.object import SimulationObject
 from fdtdx.typing import GridShape3D, Slice3D, SliceTuple3D
 
@@ -53,23 +54,104 @@ class BaseBoundary(SimulationObject, ABC):
         return False
 
     def apply_pad_correction(
-        self, padded_fields: jax.Array, volume_shape: tuple[int, int, int], resolution: float
+        self,
+        padded_fields: jax.Array,
+        volume_shape: tuple[int, int, int],
+        resolution: float,
+        width: int = 1,
+        field_type: Literal["E", "H"] | None = None,
     ) -> jax.Array:
         """Apply boundary-specific correction to padded fields.
 
         Called after basic wrap/constant padding. Default is a no-op.
         Subclasses like BlochBoundary override this to apply phase shifts
-        to ghost cells.
+        to ghost cells, and PEC/PMC walls to write image (mirror) halos.
 
         Args:
-            padded_fields: Padded field array of shape (3, Nx+2, Ny+2, Nz+2)
+            padded_fields: Padded field array of shape (3, Nx+2w, Ny+2w, Nz+2w)
             volume_shape: Full simulation volume shape (Nx, Ny, Nz)
             resolution: Grid resolution in meters
+            width: Number of ghost cells per face in ``padded_fields``. The curl stencil of order
+                ``2r`` uses ``width = r``. Defaults to 1 (the classic Yee scheme).
+            field_type: Whether ``padded_fields`` holds the electric or magnetic field, or ``None``
+                when the caller does not need a field-type-dependent correction (the anisotropic
+                material averaging and the detector co-location stencil, both of which only ever
+                use ``width = 1``). Defaults to ``None``.
 
         Returns:
             Padded fields with boundary-specific corrections applied
         """
+        del volume_shape, resolution, width, field_type
         return padded_fields
+
+    def _padded_cross_section(self, width: int) -> tuple[slice, slice, slice]:
+        """Padded-index slices of this boundary's footprint on the axes it does not terminate.
+
+        The entry for :attr:`axis` is ``slice(None)``; the other two cover the boundary's own grid
+        extent shifted by the halo ``width``. Restricting the image halo to that cross-section keeps
+        the fill of two perpendicular walls independent of the order they are applied in — the
+        corner halo they would fight over is never read by the curl of an in-domain sample.
+
+        Args:
+            width (int): Number of ghost cells per face in the padded array.
+
+        Returns:
+            tuple[slice, slice, slice]: The cross-section, indexed in padded coordinates.
+        """
+        region: list[slice] = []
+        for a in range(3):
+            if a == self.axis:
+                region.append(slice(None))
+            else:
+                lo, hi = self._grid_slice_tuple[a]
+                region.append(slice(lo + width, hi + width))
+        return region[0], region[1], region[2]
+
+    def _apply_image_halo(
+        self,
+        padded_fields: jax.Array,
+        width: int,
+        field_type: Literal["E", "H"] | None,
+        wall: int,
+    ) -> jax.Array:
+        """Write the mirror image of the interior into the samples outside this wall.
+
+        A no-op for ``width <= 1``: the classic Yee curl never reads the halo of a wall (only the
+        tangential components the wall zeroes right afterwards do), so the zero halo is exact there
+        and leaving it untouched keeps the order-2 path bit-identical.
+
+        The plane is the node the wall drives to zero: the tangential-E node at the lower edge of
+        the wall cell for an electric wall, the tangential-H node at its centre for a magnetic one.
+
+        Args:
+            padded_fields (jax.Array): Padded field array of shape ``(3, Nx+2w, Ny+2w, Nz+2w)``.
+            width (int): Number of ghost cells per face.
+            field_type (Literal["E", "H"] | None): Which field is padded, or ``None`` to skip.
+            wall (int): ``-1`` for an electric wall (PEC), ``+1`` for a magnetic wall (PMC).
+
+        Returns:
+            jax.Array: The padded array with the exterior samples replaced by their images.
+        """
+        if width <= 1 or field_type is None:
+            return padded_fields
+        lo, hi = self._grid_slice_tuple[self.axis]
+        # "-" terminates the domain from below, so the wall cell is the slab's last one.
+        wall_cell = hi - 1 if self.direction == "-" else lo
+        # The plane is the node the wall drives to zero inside its own cell, on either face: the
+        # tangential-E node at the cell's lower edge for an electric wall, the tangential-H node at
+        # the cell centre for a magnetic one. An electric "+" face therefore leaves the upper half of
+        # its cell outside the domain, and a magnetic "-" face the lower half of its.
+        plane_twice = 2 * wall_cell + (0 if wall == -1 else 1)
+        return fill_image_halo(
+            padded_fields,
+            axis=self.axis,
+            width=width,
+            field_type=field_type,
+            wall=wall,
+            plane_twice=plane_twice,
+            side=self.direction,
+            region=self._padded_cross_section(width),
+        )
 
     def apply_post_E_update(self, E: jax.Array) -> jax.Array:
         """Apply boundary-specific enforcement after E field update.
@@ -114,31 +196,53 @@ class BaseBoundary(SimulationObject, ABC):
         """
         return fields
 
-    def interface_grid_shape(self) -> GridShape3D:
-        if self.axis == 0:
-            return 1, self.grid_shape[1], self.grid_shape[2]
-        elif self.axis == 1:
-            return self.grid_shape[0], 1, self.grid_shape[2]
-        elif self.axis == 2:
-            return self.grid_shape[0], self.grid_shape[1], 1
-        raise Exception(f"Invalid axis: {self.axis=}")
+    def interface_grid_shape(self, width: int = 1) -> GridShape3D:
+        """Shape of the interface slab of this boundary (see :meth:`interface_slice`).
 
-    def interface_slice_tuple(self) -> SliceTuple3D:
+        Args:
+            width (int): Thickness of the slab in cells along the boundary axis. Defaults to 1.
+
+        Returns:
+            GridShape3D: The boundary's grid shape with the axis extent replaced by ``width``.
+        """
+        shape = list(self.grid_shape)
+        shape[self.axis] = width
+        return shape[0], shape[1], shape[2]
+
+    def interface_slice_tuple(self, width: int = 1) -> SliceTuple3D:
+        """Grid bounds of the ``width`` innermost cells of this boundary along its axis.
+
+        The interface slab is the part of the boundary region adjacent to the interior. The
+        reversible adjoint records the fields there every step, because the boundary update is not
+        time reversible and the interior reconstruction reads these cells through the curl stencil.
+        A stencil with ``r`` taps per side needs ``width = 2r - 1``.
+
+        Args:
+            width (int): Thickness of the slab in cells. Defaults to 1 (classic Yee scheme).
+
+        Returns:
+            SliceTuple3D: ``((x0, x1), (y0, y1), (z0, z1))`` of the slab.
+        """
+        if width < 1 or width > self.grid_shape[self.axis]:
+            raise ValueError(
+                f"Interface width {width} must be in [1, {self.grid_shape[self.axis]}] for boundary {self.name}"
+            )
         slice_list = [*self._grid_slice_tuple]
+        lo, hi = self._grid_slice_tuple[self.axis]
         if self.direction == "+":
-            slice_list[self.axis] = (self._grid_slice_tuple[self.axis][0], self._grid_slice_tuple[self.axis][0] + 1)
+            slice_list[self.axis] = (lo, lo + width)
         elif self.direction == "-":
-            slice_list[self.axis] = (self._grid_slice_tuple[self.axis][1] - 1, self._grid_slice_tuple[self.axis][1])
+            slice_list[self.axis] = (hi - width, hi)
         return slice_list[0], slice_list[1], slice_list[2]
 
-    def interface_slice(self) -> Slice3D:
-        slice_list = [*self.grid_slice]
-        if self.direction == "+":
-            slice_list[self.axis] = slice(
-                self._grid_slice_tuple[self.axis][0], self._grid_slice_tuple[self.axis][0] + 1
-            )
-        elif self.direction == "-":
-            slice_list[self.axis] = slice(
-                self._grid_slice_tuple[self.axis][1] - 1, self._grid_slice_tuple[self.axis][1]
-            )
-        return slice_list[0], slice_list[1], slice_list[2]
+    def interface_slice(self, width: int = 1) -> Slice3D:
+        """Slice form of :meth:`interface_slice_tuple`.
+
+        Args:
+            width (int): Thickness of the slab in cells. Defaults to 1.
+
+        Returns:
+            Slice3D: The slab as a tuple of three slices.
+        """
+        bounds = self.interface_slice_tuple(width)
+        return slice(*bounds[0]), slice(*bounds[1]), slice(*bounds[2])

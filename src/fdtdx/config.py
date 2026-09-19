@@ -8,6 +8,7 @@ from loguru import logger
 from fdtdx import constants
 from fdtdx.core.grid import QuasiUniformGrid, RectilinearGrid, UniformGrid
 from fdtdx.core.jax.pytrees import TreeClass, autoinit, field, frozen_field
+from fdtdx.core.physics.stencil import SUPPORTED_CURL_ORDERS, stencil_cfl_factor, stencil_radius
 from fdtdx.interfaces.recorder import Recorder
 from fdtdx.typing import BackendOption
 
@@ -44,6 +45,21 @@ class GradientConfig(TreeClass):
     #: by the ``"checkpointed"`` method. Must not exceed ``time_steps_total - 1``.
     num_checkpoints_reversible: int = frozen_field(default=0)
 
+    #: How the ``"reversible"`` method stores the PML interface record that the reverse pass needs.
+    #:
+    #: ``"full"`` (default): the forward pass records the interface values of every time step, so the
+    #: recorder buffer has ``time_steps_total`` entries (O(T) memory, one forward + one reverse sweep).
+    #:
+    #: ``"segmented"``: the forward pass stores only the full-field checkpoints that partition the run
+    #: into ``num_checkpoints_reversible + 1`` segments and records nothing. During the backward pass each
+    #: segment is re-simulated forward from its checkpoint to regenerate the interface record for that
+    #: segment alone, then reversed. The recorder buffer therefore only has ``segment_length`` entries
+    #: (``ceil(time_steps_total / (num_checkpoints_reversible + 1))``) at the cost of one extra forward
+    #: sweep (roughly 3x instead of 2x the forward wall time). This bounds the memory of the exact
+    #: (``k = 1``) reversible adjoint for arbitrarily long runs instead of forcing a lossy
+    #: :class:`~fdtdx.LinearReconstructEveryK` compression. Ignored by the ``"checkpointed"`` method.
+    recording_mode: Literal["full", "segmented"] = frozen_field(default="full")
+
     def __post_init__(self):
         if self.method == "reversible" and self.recorder is None:
             raise Exception("Need Recorder in gradient config to compute reversible gradients")
@@ -51,6 +67,35 @@ class GradientConfig(TreeClass):
             raise Exception("Need Checkpoint Number in gradient config to compute checkpointed gradients")
         if self.num_checkpoints_reversible < 0:
             raise Exception("num_checkpoints_reversible must be >= 0")
+        if self.recording_mode not in ("full", "segmented"):
+            raise Exception(f"recording_mode must be 'full' or 'segmented', got {self.recording_mode!r}")
+        if self.recording_mode == "segmented" and self.method != "reversible":
+            raise Exception("recording_mode='segmented' is only meaningful for method='reversible'")
+
+    @property
+    def is_segmented(self) -> bool:
+        """Whether the reversible backward pass regenerates the interface record segment by segment.
+
+        Returns:
+            bool: True iff ``method == "reversible"`` and ``recording_mode == "segmented"``.
+        """
+        return self.method == "reversible" and self.recording_mode == "segmented"
+
+    def reversible_segment_length(self, time_steps_total: int) -> int:
+        """Length (in time steps) of the segments of the reversible pass.
+
+        The run is partitioned into segments of ``ceil(time_steps_total / (num_checkpoints_reversible + 1))``
+        steps (the last one possibly shorter), with a full-field checkpoint at the start of every segment.
+        In ``"segmented"`` recording mode this is also the length of the recorder buffer.
+
+        Args:
+            time_steps_total (int): Total number of forward time steps.
+
+        Returns:
+            int: Segment length ``>= 1`` (``time_steps_total`` itself when there are no checkpoints).
+        """
+        num_segments = self.num_checkpoints_reversible + 1
+        return max(1, -(-time_steps_total // num_segments))
 
 
 @autoinit
@@ -86,8 +131,21 @@ class SimulationConfig(TreeClass):
     #: False: force real fields (raises error if Bloch boundaries are present).
     use_complex_fields: bool | None = frozen_field(default=None)
 
-    #: Safety factor for the Courant condition (default: 0.99).
+    #: Safety factor for the Courant condition (default: 0.99). The time step is
+    #: ``courant_factor`` times the stability limit of the selected spatial stencil, see
+    #: :attr:`courant_number`.
     courant_factor: float = frozen_field(default=0.99)
+
+    #: Order of accuracy of the spatial curl stencil, one of ``2, 4, 6, 8`` (default: 2, the classic
+    #: Yee scheme). Order ``2r`` uses ``r`` taps on each side of the staggered derivative point
+    #: (``9/8, -1/24`` for order 4), which reduces numerical dispersion and improves the accuracy
+    #: of resonance frequencies at a given resolution. Higher orders need a ``2r``-cell field halo,
+    #: a wider PML interface record for the reversible adjoint (``2r - 1`` cells per face), and a
+    #: smaller time step: the stable Courant number scales with ``1 / sum_m |a_m|`` (``6/7`` for
+    #: order 4), which :attr:`time_step_duration` applies automatically. PEC/PMC walls, periodic and
+    #: Bloch boundaries and ``symmetry`` planes are handled consistently by image (mirror) halos.
+    #: Requires a constant spacing along every axis (the spacings may differ between axes).
+    curl_order: int = frozen_field(default=2)
 
     #: Per-axis mirror symmetry of the simulation, in the order (x, y, z).
     #: Each entry is one of ``{-1, 0, +1}``:
@@ -122,6 +180,10 @@ class SimulationConfig(TreeClass):
                 f"config.symmetry must be a length-3 tuple with each entry in {{-1, 0, +1}} "
                 f"(0=none, -1=PEC, +1=PMC), got {self.symmetry!r}"
             )
+        if self.curl_order not in SUPPORTED_CURL_ORDERS:
+            raise ValueError(f"config.curl_order must be one of {SUPPORTED_CURL_ORDERS}, got {self.curl_order!r}")
+        if self.curl_order > 2 and isinstance(self.grid, RectilinearGrid) and not self.grid.is_per_axis_uniform:
+            raise ValueError("config.curl_order > 2 requires a grid with constant spacing along every axis")
 
         current_platform = extend.backend.get_backend().platform
 
@@ -170,11 +232,27 @@ class SimulationConfig(TreeClass):
         of the FDTD simulation. It represents the ratio of the physical propagation
         speed to the numerical propagation speed.
 
+        For ``curl_order > 2`` the stability limit of the wider stencil is smaller by the factor
+        ``sum_m |a_m|`` (``7/6`` for order 4), which is applied here so that ``courant_factor``
+        keeps its meaning of "fraction of the stable time step" for every order.
+
         Returns:
             float: The Courant number, scaled by the courant_factor and normalized
-                for 3D simulations.
+                for 3D simulations and the selected curl stencil.
         """
-        return self.courant_factor / math.sqrt(3)
+        return self.courant_factor / (math.sqrt(3) * stencil_cfl_factor(self.curl_order))
+
+    @property
+    def curl_stencil_radius(self) -> int:
+        """Number of taps on each side of the staggered derivative point, ``curl_order // 2``.
+
+        This is the halo width the field arrays are padded with before every curl and the number of
+        ghost cells every boundary must fill consistently.
+
+        Returns:
+            int: ``curl_order // 2`` (1 for the classic Yee scheme).
+        """
+        return stencil_radius(self.curl_order)
 
     def resolve_grid(self, shape: tuple[int, int, int] | None = None) -> RectilinearGrid:
         """Return a concrete solver grid.
@@ -243,7 +321,7 @@ class SimulationConfig(TreeClass):
                 condition and spatial resolution.
         """
         if isinstance(self.grid, RectilinearGrid):
-            return self.grid.cfl_time_step(self.courant_factor)
+            return self.grid.cfl_time_step(self.courant_factor / stencil_cfl_factor(self.curl_order))
         if isinstance(self.grid, UniformGrid):
             return self.courant_number * self.grid.spacing / constants.c
         if isinstance(self.grid, QuasiUniformGrid):

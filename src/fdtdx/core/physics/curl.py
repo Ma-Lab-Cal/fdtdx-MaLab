@@ -3,6 +3,7 @@ import jax.numpy as jnp
 
 from fdtdx.config import SimulationConfig
 from fdtdx.constants import c as c0
+from fdtdx.core.physics.stencil import staggered_stencil_coefficients
 from fdtdx.fdtd.container import ObjectContainer, PmlAuxField
 from fdtdx.typing import SliceTuple3D
 
@@ -37,6 +38,95 @@ def _metric_scale(
     broadcast_shape = [1, 1, 1]
     broadcast_shape[axis] = shape[axis]
     return scale.reshape(tuple(broadcast_shape))
+
+
+def _curl_stencil(
+    config: SimulationConfig, padded_shape: tuple[int, ...]
+) -> tuple[int, tuple[float, ...], tuple[int, int, int]]:
+    """Resolve the staggered stencil radius, taps and unpadded shape for a curl call.
+
+    Args:
+        config (SimulationConfig): Simulation configuration providing ``curl_order``.
+        padded_shape (tuple[int, ...]): Shape of the padded field array, ``(3, nx+2r, ny+2r, nz+2r)``.
+
+    Returns:
+        tuple[int, tuple[float, ...], tuple[int, int, int]]: The radius ``r``, the ``r`` tap weights
+        and the unpadded spatial shape ``(nx, ny, nz)``.
+
+    Raises:
+        ValueError: If the padded array is too small for the requested halo.
+        NotImplementedError: If a stretched (per-axis non-uniform) grid is combined with ``r > 1``.
+    """
+    r = config.curl_stencil_radius
+    shape = (padded_shape[1] - 2 * r, padded_shape[2] - 2 * r, padded_shape[3] - 2 * r)
+    if min(shape) < 1:
+        raise ValueError(
+            f"Field of padded shape {tuple(padded_shape)} is too small for a curl stencil of order "
+            f"{config.curl_order}, which needs a halo of {r} cells on every face."
+        )
+    if r > 1 and config.has_nonuniform_grid:
+        grid = config.resolved_grid
+        if grid is None or not grid.is_per_axis_uniform:
+            raise NotImplementedError(
+                f"config.curl_order={config.curl_order} is only implemented for grids with a constant "
+                "spacing along every axis (the spacings may differ between axes); the staggered tap "
+                "weights assume equal spacing along the differentiated axis. Use curl_order=2 on a "
+                "stretched grid."
+            )
+    return r, staggered_stencil_coefficients(config.curl_order), shape
+
+
+def _staggered_derivative(
+    field_pad: jax.Array,
+    axis: int,
+    r: int,
+    coeffs: tuple[float, ...],
+    kind: str,
+) -> jax.Array:
+    """Staggered central difference of one padded field component along one axis.
+
+    With ``a_m = coeffs[m - 1]`` the order-``2r`` staggered stencils are::
+
+        kind == "E":  dE(i) = sum_m a_m * (E[i + m]     - E[i - m + 1])   (integer -> half)
+        kind == "H":  dH(i) = sum_m a_m * (H[i + m - 1] - H[i - m])       (half -> integer)
+
+    Both reduce to the plain Yee difference for ``r == 1``, which is emitted verbatim (no
+    multiplication by ``a_1 = 1``) so the classic scheme stays bit-identical. All index arithmetic
+    is static, so this lowers to plain ``lax.slice`` operations.
+
+    Args:
+        field_pad (jax.Array): One padded field component, shape ``(nx+2r, ny+2r, nz+2r)``.
+        axis (int): Axis to differentiate along (0=x, 1=y, 2=z).
+        r (int): Stencil radius (half the order), equal to the halo width.
+        coeffs (tuple[float, ...]): The ``r`` tap weights.
+        kind (str): ``"E"`` for the integer-to-half stencil, ``"H"`` for half-to-integer.
+
+    Returns:
+        jax.Array: The derivative on the unpadded grid, shape ``(nx, ny, nz)``.
+
+    Raises:
+        ValueError: If ``kind`` is neither ``"E"`` nor ``"H"``.
+    """
+    if kind not in ("E", "H"):
+        raise ValueError(f"Unknown staggered stencil kind: {kind!r}")
+    shape = tuple(s - 2 * r for s in field_pad.shape)
+
+    def block(start: int) -> tuple[slice, slice, slice]:
+        idx = [slice(r, r + shape[a]) for a in range(3)]
+        idx[axis] = slice(start, start + shape[axis])
+        return idx[0], idx[1], idx[2]
+
+    def tap(m: int) -> jax.Array:
+        if kind == "E":
+            return field_pad[block(r + m)] - field_pad[block(r - m + 1)]
+        return field_pad[block(r + m - 1)] - field_pad[block(r - m)]
+
+    if r == 1:
+        return tap(1)
+    out = coeffs[0] * tap(1)
+    for m in range(2, r + 1):
+        out = out + coeffs[m - 1] * tap(m)
+    return out
 
 
 def _backward_edge_average(
@@ -244,7 +334,8 @@ def curl_E(
 
     Args:
         config (SimulationConfig): Simulation configuration parameters.
-        E_pad (jax.Array): Pre-padded electric field of shape (3, nx+2, ny+2, nz+2).
+        E_pad (jax.Array): Pre-padded electric field of shape (3, nx+2r, ny+2r, nz+2r), where
+            ``r = config.curl_stencil_radius``.
         psi_H (PmlAuxField): Dictionary mapping PML object
             names to their auxiliary magnetic field states.
         objects (ObjectContainer): Object collection containing `pml_objects`, which are used to apply
@@ -257,7 +348,8 @@ def curl_E(
               half-integer grid points). Has same shape as unpadded input (3, nx, ny, nz).
             - The updated dictionary of auxiliary magnetic fields `psi_H`.
     """
-    shape = E_pad.shape[1] - 2, E_pad.shape[2] - 2, E_pad.shape[3] - 2
+    r, coeffs, shape = _curl_stencil(config, E_pad.shape)
+    assert E_pad.shape[1:] == (shape[0] + 2 * r, shape[1] + 2 * r, shape[2] + 2 * r)
     dx_scale = _metric_scale(config, axis=0, shape=shape, stencil="forward")
     dy_scale = _metric_scale(config, axis=1, shape=shape, stencil="forward")
     dz_scale = _metric_scale(config, axis=2, shape=shape, stencil="forward")
@@ -265,14 +357,13 @@ def curl_E(
     Ex = E_pad[0]
     Ey = E_pad[1]
     Ez = E_pad[2]
-    center = (slice(1, -1), slice(1, -1), slice(1, -1))
 
-    dyEz = (Ez[1:-1, 2:, 1:-1] - Ez[center]) * dy_scale
-    dzEy = (Ey[1:-1, 1:-1, 2:] - Ey[center]) * dz_scale
-    dzEx = (Ex[1:-1, 1:-1, 2:] - Ex[center]) * dz_scale
-    dxEz = (Ez[2:, 1:-1, 1:-1] - Ez[center]) * dx_scale
-    dxEy = (Ey[2:, 1:-1, 1:-1] - Ey[center]) * dx_scale
-    dyEx = (Ex[1:-1, 2:, 1:-1] - Ex[center]) * dy_scale
+    dyEz = _staggered_derivative(Ez, 1, r, coeffs, "E") * dy_scale
+    dzEy = _staggered_derivative(Ey, 2, r, coeffs, "E") * dz_scale
+    dzEx = _staggered_derivative(Ex, 2, r, coeffs, "E") * dz_scale
+    dxEz = _staggered_derivative(Ez, 0, r, coeffs, "E") * dx_scale
+    dxEy = _staggered_derivative(Ey, 0, r, coeffs, "E") * dx_scale
+    dyEx = _staggered_derivative(Ex, 1, r, coeffs, "E") * dy_scale
 
     curl_x = dyEz - dzEy
     curl_y = dzEx - dxEz
@@ -331,7 +422,8 @@ def curl_H(
 
     Args:
         config (SimulationConfig): Simulation configuration parameters.
-        H_pad (jax.Array): Pre-padded magnetic field of shape (3, nx+2, ny+2, nz+2).
+        H_pad (jax.Array): Pre-padded magnetic field of shape (3, nx+2r, ny+2r, nz+2r), where
+            ``r = config.curl_stencil_radius``.
         psi_E (PmlAuxField): Dictionary mapping PML object
             names to their auxiliary electric field states.
         objects (ObjectContainer): Object collection containing `pml_objects`, which are used to apply
@@ -344,7 +436,8 @@ def curl_H(
               integer grid points). Has same shape as unpadded input (3, nx, ny, nz).
             - The updated dictionary of auxiliary electric fields `psi_E`.
     """
-    shape = H_pad.shape[1] - 2, H_pad.shape[2] - 2, H_pad.shape[3] - 2
+    r, coeffs, shape = _curl_stencil(config, H_pad.shape)
+    assert H_pad.shape[1:] == (shape[0] + 2 * r, shape[1] + 2 * r, shape[2] + 2 * r)
     dx_scale = _metric_scale(config, axis=0, shape=shape, stencil="backward")
     dy_scale = _metric_scale(config, axis=1, shape=shape, stencil="backward")
     dz_scale = _metric_scale(config, axis=2, shape=shape, stencil="backward")
@@ -352,14 +445,13 @@ def curl_H(
     Hx = H_pad[0]
     Hy = H_pad[1]
     Hz = H_pad[2]
-    center = (slice(1, -1), slice(1, -1), slice(1, -1))
 
-    dyHz = (Hz[center] - Hz[1:-1, :-2, 1:-1]) * dy_scale
-    dzHy = (Hy[center] - Hy[1:-1, 1:-1, :-2]) * dz_scale
-    dzHx = (Hx[center] - Hx[1:-1, 1:-1, :-2]) * dz_scale
-    dxHz = (Hz[center] - Hz[:-2, 1:-1, 1:-1]) * dx_scale
-    dxHy = (Hy[center] - Hy[:-2, 1:-1, 1:-1]) * dx_scale
-    dyHx = (Hx[center] - Hx[1:-1, :-2, 1:-1]) * dy_scale
+    dyHz = _staggered_derivative(Hz, 1, r, coeffs, "H") * dy_scale
+    dzHy = _staggered_derivative(Hy, 2, r, coeffs, "H") * dz_scale
+    dzHx = _staggered_derivative(Hx, 2, r, coeffs, "H") * dz_scale
+    dxHz = _staggered_derivative(Hz, 0, r, coeffs, "H") * dx_scale
+    dxHy = _staggered_derivative(Hy, 0, r, coeffs, "H") * dx_scale
+    dyHx = _staggered_derivative(Hx, 1, r, coeffs, "H") * dy_scale
 
     curl_x = dyHz - dzHy
     curl_y = dzHx - dxHz

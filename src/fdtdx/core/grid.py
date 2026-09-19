@@ -311,6 +311,7 @@ class RectilinearGrid(TreeClass):
     z_edges: jax.Array = field()
     _min_spacings: tuple[float, float, float] = frozen_private_field()
     _is_uniform: bool = frozen_private_field()
+    _is_per_axis_uniform: bool = frozen_private_field()
     _uniform_spacing: float | None = frozen_private_field()
     _cell_widths: tuple[jax.Array, jax.Array, jax.Array] = private_field(repr=False)
 
@@ -345,8 +346,20 @@ class RectilinearGrid(TreeClass):
             if float(np.max(np.abs(widths - spacing))) > 1e-4 * abs(spacing) + roundoff:
                 is_uniform = False
                 break
+        # Per-axis uniformity (each axis may have its own constant spacing). Higher-order curl
+        # stencils are valid on such grids because the tap weights only assume equal spacing along
+        # the differentiated axis.
+        is_per_axis_uniform = True
+        for edges_np, widths in zip(edge_arrays_np, width_arrays):
+            axis_spacing = float(widths[0])
+            eps = float(np.finfo(edges_np.dtype).eps) if np.issubdtype(edges_np.dtype, np.floating) else 0.0
+            roundoff = 8.0 * eps * float(np.max(np.abs(edges_np)))
+            if float(np.max(np.abs(widths - axis_spacing))) > 1e-4 * abs(axis_spacing) + roundoff:
+                is_per_axis_uniform = False
+                break
         object.__setattr__(self, "_min_spacings", min_spacings)
         object.__setattr__(self, "_is_uniform", is_uniform)
+        object.__setattr__(self, "_is_per_axis_uniform", is_per_axis_uniform)
         object.__setattr__(self, "_uniform_spacing", float(np.round(spacing, decimals=14)) if is_uniform else None)
 
     @classmethod
@@ -514,6 +527,11 @@ class RectilinearGrid(TreeClass):
     def is_uniform(self) -> bool:
         """Whether all cell widths match a single spacing within numerical tolerance."""
         return self._is_uniform
+
+    @property
+    def is_per_axis_uniform(self) -> bool:
+        """Whether every axis has a constant spacing (the spacings may differ between axes)."""
+        return self._is_per_axis_uniform
 
     @property
     def uniform_spacing(self) -> float:

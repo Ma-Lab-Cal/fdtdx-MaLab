@@ -98,14 +98,18 @@ class TestReversibleSliceBoundaries:
     )
     def test_boundaries_are_valid_partition(self, time_steps_total, num_slices):
         b = _reversible_slice_boundaries(time_steps_total, num_slices)
-        # k + 1 boundaries, from 0 to T inclusive
-        assert len(b) == num_slices + 1
+        # at most k + 1 boundaries, from 0 to T inclusive; segments have equal length
+        # ceil(T / k) except for a shorter tail
+        segment_length = -(-time_steps_total // num_slices)
+        assert 2 <= len(b) <= num_slices + 1
         assert b[0] == 0
         assert b[-1] == time_steps_total
-        # strictly increasing (distinct) and every slice has length >= 1
+        # strictly increasing (distinct) and every slice has length in [1, segment_length]
         assert b == sorted(b)
         assert len(set(b)) == len(b)
-        assert all(b[i + 1] - b[i] >= 1 for i in range(num_slices))
+        lengths = [b[i + 1] - b[i] for i in range(len(b) - 1)]
+        assert all(1 <= n <= segment_length for n in lengths)
+        assert all(n == segment_length for n in lengths[:-1])
 
     def test_single_slice_is_full_range(self):
         """num_slices == 1 (num_checkpoints_reversible == 0) yields no interior boundaries."""

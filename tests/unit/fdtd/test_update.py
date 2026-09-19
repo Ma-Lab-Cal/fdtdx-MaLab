@@ -69,12 +69,14 @@ def _make_objects(sources=None):
     return obj
 
 
-def _make_config(c=0.5, symmetry=(0, 0, 0)):
+def _make_config(c=0.5, symmetry=(0, 0, 0), curl_order=2):
     cfg = Mock()
     cfg.courant_number = c
     cfg.uniform_spacing.return_value = 1.0
     cfg.has_nonuniform_grid = False
     cfg.symmetry = symmetry
+    cfg.curl_order = curl_order
+    cfg.curl_stencil_radius = curl_order // 2
     return cfg
 
 
@@ -174,7 +176,7 @@ class TestPadFieldsForBoundaries:
         boundary = Mock()
         boundary.axis = 0
         boundary.uses_wrap_padding = True
-        boundary.apply_pad_correction.side_effect = lambda padded, _shape, _spacing: padded
+        boundary.apply_pad_correction.side_effect = lambda padded, _shape, _spacing, **_kwargs: padded
 
         objects = Mock()
         objects.boundary_objects = [boundary]
@@ -194,7 +196,7 @@ class TestPadFieldsForBoundaries:
         boundary = Mock()
         boundary.axis = 1
         boundary.uses_wrap_padding = True
-        boundary.apply_pad_correction.side_effect = lambda padded, _shape, _spacing: padded
+        boundary.apply_pad_correction.side_effect = lambda padded, _shape, _spacing, **_kwargs: padded
         objects = Mock()
         objects.boundary_objects = [boundary]
         objects.volume.grid_shape = (NX, NY, NZ)
@@ -206,6 +208,58 @@ class TestPadFieldsForBoundaries:
         assert jnp.allclose(wrapped[:, 1:-1, 0, 1:-1], fields[:, :, -1, :])  # wraps without symmetry
         assert jnp.all(symmetric[:, :, 0, :] == 0.0)  # min side belongs to the mirror
         assert jnp.allclose(symmetric[:, 1:-1, -1, 1:-1], fields[:, :, 0, :])  # far side still wraps
+
+
+class TestMagneticSymmetryPlaneImageHalo:
+    """The image halo of a magnetic ``config.symmetry`` plane, which has no wall object.
+
+    The plane sits at ``y = -1/2``, half a cell below the reduced domain's min edge, with
+    magnetic-wall parities. Integer-sampled components (``E_x``, ``E_z``, ``H_y``: even) mirror the
+    first two cells outwards; half-offset ones (``E_y``, ``H_x``, ``H_z``: odd) have their outermost
+    ghost *on* the plane, which stays zero, and the next ghost mirrors cell 0 with a sign flip.
+    Only ``width > 1`` needs any of this — the classic Yee curl never reads the halo there.
+    """
+
+    def _objects(self):
+        objects = Mock()
+        objects.boundary_objects = []
+        objects.volume.grid_shape = (NX, NY, NZ)
+        return objects
+
+    def _fields(self):
+        return jnp.arange(1, 3 * NX * NY * NZ + 1, dtype=jnp.float32).reshape(FIELD_SHAPE)
+
+    @pytest.mark.parametrize("field_type,integer_components", [("E", (0, 2)), ("H", (1,))])
+    def test_width_two_fills_the_ghosts_with_the_image(self, field_type, integer_components):
+        fields = self._fields()
+        padded = pad_fields_for_boundaries(
+            fields, self._objects(), _make_config(symmetry=(0, 1, 0), curl_order=4), width=2, field_type=field_type
+        )
+        for component in range(3):
+            if component in integer_components:
+                # even parity, mirror of ghost -m is cell m-1
+                assert jnp.array_equal(padded[component, 2:-2, 0, 2:-2], fields[component, :, 1, :])
+                assert jnp.array_equal(padded[component, 2:-2, 1, 2:-2], fields[component, :, 0, :])
+            else:
+                # odd parity; the outermost ghost is on the plane and stays zero
+                assert jnp.array_equal(padded[component, 2:-2, 0, 2:-2], -fields[component, :, 0, :])
+                assert jnp.all(padded[component, :, 1, :] == 0.0)
+
+    def test_width_one_keeps_the_zero_halo(self):
+        fields = self._fields()
+        padded = pad_fields_for_boundaries(
+            fields, self._objects(), _make_config(symmetry=(0, 1, 0)), width=1, field_type="E"
+        )
+        assert jnp.all(padded[:, :, 0, :] == 0.0)
+
+    def test_electric_symmetry_axis_gets_no_image_here(self):
+        # An electric plane is a PEC wall object, so it fills its own halo; without boundaries the
+        # min-side halo of a -1 axis stays zero whatever the width.
+        fields = self._fields()
+        padded = pad_fields_for_boundaries(
+            fields, self._objects(), _make_config(symmetry=(0, -1, 0), curl_order=4), width=2, field_type="E"
+        )
+        assert jnp.all(padded[:, :, :2, :] == 0.0)
 
 
 class TestPadFieldsWithSymmetryMirror:
@@ -223,7 +277,7 @@ class TestPadFieldsWithSymmetryMirror:
         boundary.axis = axis
         boundary.uses_wrap_padding = False
         boundary._is_symmetry_wall = is_symmetry_wall
-        boundary.apply_pad_correction.side_effect = lambda padded, _shape, _spacing: padded
+        boundary.apply_pad_correction.side_effect = lambda padded, _shape, _spacing, **_kwargs: padded
         objects = Mock()
         objects.boundary_objects = [boundary]
         objects.volume.grid_shape = (NX, NY, NZ)
@@ -857,6 +911,7 @@ class TestCollectInterfaces:
         gradient_config = Mock()
         gradient_config.recorder = recorder
         config = Mock()
+        config.curl_stencil_radius = 1
         config.gradient_config = gradient_config
         objects = Mock()
         objects.pml_objects = []
@@ -917,6 +972,7 @@ class TestAddInterfaces:
         gradient_config = Mock()
         gradient_config.recorder = recorder
         config = Mock()
+        config.curl_stencil_radius = 1
         config.gradient_config = gradient_config
         objects = Mock()
         objects.pml_objects = []
@@ -956,7 +1012,7 @@ class TestAddInterfaces:
         # Pass through the arrays argument so the aset("recording_state", ...) call is preserved
         with patch(
             "fdtdx.fdtd.update.add_boundary_interfaces",
-            side_effect=lambda arrays, values, pml_objects: arrays,
+            side_effect=lambda arrays, values, pml_objects, width=1: arrays,
         ):
             result = add_interfaces(jnp.array(0), arrays, objects, config, key)
         assert result.recording_state is new_state

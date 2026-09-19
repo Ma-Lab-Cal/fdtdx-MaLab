@@ -20,6 +20,7 @@ from fdtdx.core.jax.ste import straight_through_estimator
 from fdtdx.dispersion import compute_pole_coefficients_tensor
 from fdtdx.fdtd.container import ArrayContainer, FieldState, ObjectContainer, ParameterContainer
 from fdtdx.fdtd.symmetry import apply_mode_symmetry, make_symmetry_walls, reduce_resolved_slices
+from fdtdx.fdtd.update import pml_interface_width
 from fdtdx.materials import (
     compute_allowed_dispersive_coefficients,
     compute_allowed_electric_conductivities,
@@ -70,6 +71,7 @@ def _resolve_grid_from_volume(
     is converted using the policy's per-axis spacing as a fallback.
     """
     if isinstance(config.grid, RectilinearGrid):
+        _check_curl_order_grid(config)
         return config
     object_map = {obj.name: obj for obj in objects}
     volume_obj = object_map[_resolve_volume_name(object_map)]
@@ -92,7 +94,24 @@ def _resolve_grid_from_volume(
             f"can be resolved before constraint solving."
         )
     pre_volume_shape: tuple[int, int, int] = (pre_shape_list[0], pre_shape_list[1], pre_shape_list[2])
-    return config.aset("grid", config.grid.resolve(pre_volume_shape))
+    config = config.aset("grid", config.grid.resolve(pre_volume_shape))
+    _check_curl_order_grid(config)
+    return config
+
+
+def _check_curl_order_grid(config: SimulationConfig) -> None:
+    """Raise if a higher-order curl stencil is combined with a stretched grid.
+
+    The tap weights of ``config.curl_order > 2`` assume a constant spacing along the differentiated
+    axis, so only grids that are uniform along every axis (possibly with different spacings per
+    axis) are supported.
+    """
+    grid = config.resolved_grid
+    if config.curl_order > 2 and grid is not None and not grid.is_per_axis_uniform:
+        raise ValueError(
+            f"config.curl_order={config.curl_order} requires a constant grid spacing along every axis; "
+            "the resolved grid is non-uniform."
+        )
 
 
 def place_objects(
@@ -1066,15 +1085,22 @@ def _init_arrays(
     recording_state = None
     if config.gradient_config is not None and config.gradient_config.recorder is not None:
         input_shape_dtypes = {}
+        interface_width = pml_interface_width(config)
         for boundary in objects.pml_objects:
-            cur_shape = boundary.interface_grid_shape()
+            cur_shape = boundary.interface_grid_shape(interface_width)
             extended_shape = (3, *cur_shape)
             input_shape_dtypes[f"{boundary.name}_E"] = jax.ShapeDtypeStruct(shape=extended_shape, dtype=field_dtype)
             input_shape_dtypes[f"{boundary.name}_H"] = jax.ShapeDtypeStruct(shape=extended_shape, dtype=field_dtype)
         recorder = config.gradient_config.recorder
+        # In segmented recording mode the buffer only ever holds one segment of the run: the backward
+        # pass regenerates the interface record segment by segment from full-field checkpoints.
+        if config.gradient_config.is_segmented:
+            recorder_time_steps = config.gradient_config.reversible_segment_length(config.time_steps_total)
+        else:
+            recorder_time_steps = config.time_steps_total
         recorder, recording_state = recorder.init_state(
             input_shape_dtypes=input_shape_dtypes,
-            max_time_steps=config.time_steps_total,
+            max_time_steps=recorder_time_steps,
             backend=config.backend,
         )
         grad_cfg = config.gradient_config.aset(

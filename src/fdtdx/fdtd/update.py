@@ -7,7 +7,7 @@ from fdtdx.config import SimulationConfig
 from fdtdx.constants import eta0
 from fdtdx.core.misc import expand_to_3x3, pad_fields
 from fdtdx.core.physics.curl import curl_E, curl_H, interpolate_fields
-from fdtdx.core.physics.symmetry import field_component_parity, mirror_pairs_on_plane
+from fdtdx.core.physics.symmetry import field_component_parity, fill_image_halo, mirror_pairs_on_plane
 from fdtdx.core.switch import OnOffSwitch
 from fdtdx.fdtd.container import ArrayContainer, ObjectContainer
 from fdtdx.fdtd.misc import (
@@ -93,11 +93,13 @@ def pad_fields_for_boundaries(
     fields: jax.Array,
     objects: ObjectContainer,
     config: SimulationConfig,
+    width: int = 1,
+    field_type: Literal["E", "H"] | None = None,
 ) -> jax.Array:
     """Pad fields and apply boundary-specific corrections.
 
     Combines wrap/constant padding with boundary-specific corrections
-    (e.g. Bloch phase shifts) in a single call.
+    (e.g. Bloch phase shifts, PEC/PMC image halos) in a single call.
 
     On a ``config.symmetry`` axis the *min-side* halo is never wrapped. Reduction drops the min-side
     periodic/Bloch boundary but keeps the far-side one, so that axis still reports wrap padding — and
@@ -106,22 +108,33 @@ def pad_fields_for_boundaries(
     :func:`pad_fields_with_symmetry_mirror` writes for an electric one). The far-side halo keeps
     whatever boundary the user placed.
 
+    For ``width > 1`` (a curl stencil of order > 2) the halo of a wall is no longer inert: the
+    stencil reads ``width`` cells past the plane, so every wall fills it with the parity-weighted
+    mirror image of the interior. Electric ``config.symmetry`` planes are PEC wall objects and are
+    covered by that; magnetic ones have no wall object (they sit half a cell below the min edge), so
+    their image halo is written here.
+
     Args:
         fields: Field array of shape (3, Nx, Ny, Nz)
         objects: Container with simulation objects including boundaries
         config: Simulation configuration. The scalar spacing argument is kept
             for boundary API compatibility; grid-aware boundaries should read
             physical metrics from ``config.grid`` when it is available.
+        width: Number of ghost cells added on every face. The curl stencil of order ``2r`` needs
+            ``width = config.curl_stencil_radius``. Defaults to 1 (the classic Yee scheme).
+        field_type: Whether ``fields`` holds the electric or magnetic field. Required for the image
+            halos of ``width > 1``; the width-1 callers (anisotropic material averaging, detector
+            co-location) pass ``None``. Defaults to ``None``.
 
     Returns:
-        Padded fields of shape (3, Nx+2, Ny+2, Nz+2) with all corrections applied
+        Padded fields of shape (3, Nx+2w, Ny+2w, Nz+2w) with all corrections applied
     """
     periodic_axes = get_wrap_padding_axes(objects)
-    padded = pad_fields(fields, periodic_axes)
+    padded = pad_fields(fields, periodic_axes, width=width)
     for axis in range(3):
         if config.symmetry[axis] != 0 and periodic_axes[axis]:
             index: list[slice] = [slice(None)] * padded.ndim
-            index[axis + 1] = slice(0, 1)
+            index[axis + 1] = slice(0, width)
             padded = padded.at[tuple(index)].set(0)
     boundaries = objects.boundary_objects
     if boundaries:
@@ -132,7 +145,23 @@ def pad_fields_for_boundaries(
         else:
             spacing = config.uniform_spacing()
         for boundary in boundaries:
-            padded = boundary.apply_pad_correction(padded, volume_shape, spacing)
+            padded = boundary.apply_pad_correction(padded, volume_shape, spacing, width=width, field_type=field_type)
+    if width > 1 and field_type is not None:
+        for axis in range(3):
+            if config.symmetry[axis] != 1:
+                continue
+            # A magnetic symmetry plane sits half a cell below the min edge and carries no wall
+            # object, so its image halo has to be written here. The ghost tangential-H node at
+            # x = -1/2 lies *on* the plane and stays zero (the padding already put it there).
+            padded = fill_image_halo(
+                padded,
+                axis=axis,
+                width=width,
+                field_type=field_type,
+                wall=1,
+                plane_twice=-1,
+                side="-",
+            )
     return padded
 
 
@@ -281,7 +310,9 @@ def update_E(
     inv_eps = arrays.inv_permittivities
     sigma_E = arrays.electric_conductivity
     c = config.courant_number
-    H_pad = pad_fields_for_boundaries(arrays.fields.H, objects, config)
+    H_pad = pad_fields_for_boundaries(
+        arrays.fields.H, objects, config, width=config.curl_stencil_radius, field_type="H"
+    )
     curl, psi_E = curl_H(
         config,
         H_pad,
@@ -569,7 +600,9 @@ def update_E_reverse(
     inv_eps = arrays.inv_permittivities
     sigma_E = arrays.electric_conductivity
     c = config.courant_number
-    H_pad = pad_fields_for_boundaries(arrays.fields.H, objects, config)
+    H_pad = pad_fields_for_boundaries(
+        arrays.fields.H, objects, config, width=config.curl_stencil_radius, field_type="H"
+    )
     curl, _ = curl_H(
         config,
         H_pad,
@@ -700,7 +733,9 @@ def update_H(
     inv_mu = arrays.inv_permeabilities
     sigma_H = arrays.magnetic_conductivity
     c = config.courant_number
-    E_pad = pad_fields_for_boundaries(arrays.fields.E, objects, config)
+    E_pad = pad_fields_for_boundaries(
+        arrays.fields.E, objects, config, width=config.curl_stencil_radius, field_type="E"
+    )
     curl, psi_H = curl_E(
         config,
         E_pad,
@@ -888,7 +923,9 @@ def update_H_reverse(
     inv_mu = arrays.inv_permeabilities
     sigma_H = arrays.magnetic_conductivity
     c = config.courant_number
-    E_pad = pad_fields_for_boundaries(arrays.fields.E, objects, config)
+    E_pad = pad_fields_for_boundaries(
+        arrays.fields.E, objects, config, width=config.curl_stencil_radius, field_type="E"
+    )
     curl, _ = curl_E(
         config,
         E_pad,
@@ -1120,12 +1157,29 @@ def update_detector_states(
     return arrays
 
 
+def pml_interface_width(config: SimulationConfig) -> int:
+    """Thickness of the PML interface slab recorded for the reversible adjoint.
+
+    A curl stencil with ``r`` taps per side reads ``r`` cells across the interior/PML interface. The
+    reverse reconstruction of the interior is exact if the recorded slab covers every PML cell that
+    the two-stage (H then E) reverse update of the interior reads, which is ``2r - 1`` cells.
+
+    Args:
+        config (SimulationConfig): Simulation configuration (provides ``curl_order``).
+
+    Returns:
+        int: Slab width in cells (1 for the classic Yee scheme).
+    """
+    return 2 * config.curl_stencil_radius - 1
+
+
 def collect_interfaces(
     time_step: jax.Array,
     arrays: ArrayContainer,
     objects: ObjectContainer,
     config: SimulationConfig,
     key: jax.Array,
+    record_time_offset: int | jax.Array = 0,
 ) -> ArrayContainer:
     """Collects field values at PML interfaces for gradient computation.
 
@@ -1139,6 +1193,9 @@ def collect_interfaces(
         objects (ObjectContainer): Container with PML and other simulation objects
         config (SimulationConfig): Simulation configuration with gradient settings
         key (jax.Array): Random key for compression
+        record_time_offset (int | jax.Array): Time step of the first entry of the recorder buffer. The
+            values are stored at index ``time_step - record_time_offset``; the segmented reversible
+            pass uses this to record each segment into a buffer of segment length. Defaults to 0.
 
     Returns:
         ArrayContainer: Updated ArrayContainer with recorded interface values
@@ -1150,11 +1207,12 @@ def collect_interfaces(
     values = collect_boundary_interfaces(
         arrays=arrays,
         pml_objects=objects.pml_objects,
+        width=pml_interface_width(config),
     )
     recording_state = config.gradient_config.recorder.compress(
         values=values,
         state=arrays.recording_state,
-        time_step=time_step,
+        time_step=time_step - record_time_offset,
         key=key,
     )
     arrays = arrays.aset("recording_state", recording_state)
@@ -1167,6 +1225,7 @@ def add_interfaces(
     objects: ObjectContainer,
     config: SimulationConfig,
     key: jax.Array,
+    record_time_offset: int | jax.Array = 0,
 ) -> ArrayContainer:
     """Adds previously collected interface values back to the fields.
 
@@ -1180,6 +1239,8 @@ def add_interfaces(
         objects (ObjectContainer): Container with PML and other simulation objects
         config (SimulationConfig): Simulation configuration with gradient settings
         key (jax.Array): Random key for decompression
+        record_time_offset (int | jax.Array): Time step of the first entry of the recorder buffer, see
+            :func:`collect_interfaces`. Defaults to 0.
 
     Returns:
         ArrayContainer: Updated ArrayContainer with restored interface values
@@ -1191,7 +1252,7 @@ def add_interfaces(
 
     values, state = config.gradient_config.recorder.decompress(
         state=arrays.recording_state,
-        time_step=time_step,
+        time_step=time_step - record_time_offset,
         key=key,
     )
     arrays = arrays.aset("recording_state", state)
@@ -1200,6 +1261,7 @@ def add_interfaces(
         arrays=arrays,
         values=values,
         pml_objects=objects.pml_objects,
+        width=pml_interface_width(config),
     )
 
     return container

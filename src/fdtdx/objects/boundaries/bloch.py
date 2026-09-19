@@ -1,5 +1,5 @@
 import functools
-from typing import cast
+from typing import Literal, cast
 
 import jax
 import jax.numpy as jnp
@@ -59,38 +59,48 @@ class BlochBoundary(BaseBoundary):
 
     @override
     def apply_pad_correction(
-        self, padded_fields: jax.Array, volume_shape: tuple[int, int, int], resolution: float
+        self,
+        padded_fields: jax.Array,
+        volume_shape: tuple[int, int, int],
+        resolution: float,
+        width: int = 1,
+        field_type: Literal["E", "H"] | None = None,
     ) -> jax.Array:
         """Apply Bloch phase shift to ghost cells of padded fields.
 
-        For the '-' direction boundary: left ghost cell (index 0 on padded axis)
-        is multiplied by conj(phase).
-        For the '+' direction boundary: right ghost cell (index -1 on padded axis)
-        is multiplied by phase.
+        For the '-' direction boundary: the ``width`` left ghost cells (indices ``0 .. width-1`` on
+        the padded axis) are multiplied by conj(phase).
+        For the '+' direction boundary: the ``width`` right ghost cells are multiplied by phase.
+
+        Every ghost cell wraps around the full domain exactly once, so they all carry the same
+        phase factor whatever the halo width.
 
         Args:
-            padded_fields: Padded field array of shape (3, Nx+2, Ny+2, Nz+2)
+            padded_fields: Padded field array of shape (3, Nx+2w, Ny+2w, Nz+2w)
             volume_shape: Full simulation volume shape (Nx, Ny, Nz)
             resolution: Grid resolution in meters
+            width: Number of ghost cells per face in ``padded_fields``
+            field_type: Unused; the phase does not depend on which field is padded
 
         Returns:
             Padded fields with Bloch phase corrections applied
         """
+        del field_type
         if not self.needs_complex_fields:
             return padded_fields
         phase = self.get_bloch_phase(volume_shape, resolution)
         # padded axis index is self.axis + 1 (field arrays have leading component dim)
         ax = self.axis + 1
         if self.direction == "-":
-            # Left ghost wraps from the right end: multiply by conj(phase)
+            # Left ghosts wrap from the right end: multiply by conj(phase)
             idx = cast(list[slice | int], [slice(None)] * padded_fields.ndim)
-            idx[ax] = 0
+            idx[ax] = 0 if width == 1 else slice(0, width)
             idx_tuple = tuple(idx)
             padded_fields = padded_fields.at[idx_tuple].set(padded_fields[idx_tuple] * jnp.conj(phase))
         else:
-            # Right ghost wraps from the left end: multiply by phase
+            # Right ghosts wrap from the left end: multiply by phase
             idx = cast(list[slice | int], [slice(None)] * padded_fields.ndim)
-            idx[ax] = -1
+            idx[ax] = -1 if width == 1 else slice(padded_fields.shape[ax] - width, None)
             idx_tuple = tuple(idx)
             padded_fields = padded_fields.at[idx_tuple].set(padded_fields[idx_tuple] * phase)
         return padded_fields

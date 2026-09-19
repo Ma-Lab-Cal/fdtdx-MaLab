@@ -21,7 +21,7 @@ class MockPML:
         self._start = start
         self._end = end
 
-    def interface_slice(self):
+    def interface_slice(self, width=1):
         return (slice(self._start, self._end),)
 
 

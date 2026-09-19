@@ -25,6 +25,7 @@ def forward_single_args_wrapper(
     simulate_boundaries: bool,
     electric_conductivity: jax.Array | None = None,
     magnetic_conductivity: jax.Array | None = None,
+    record_time_offset: int | jax.Array = 0,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -66,6 +67,7 @@ def forward_single_args_wrapper(
         record_detectors=record_detectors,
         record_boundaries=record_boundaries,
         simulate_boundaries=simulate_boundaries,
+        record_time_offset=record_time_offset,
     )
     return (
         state[0],
@@ -80,6 +82,95 @@ def forward_single_args_wrapper(
     )
 
 
+def forward_step_primals(
+    time_step: jax.Array,
+    E: jax.Array,
+    H: jax.Array,
+    psi_E: PmlAuxField,
+    psi_H: PmlAuxField,
+    inv_permittivities: jax.Array,
+    inv_permeabilities: jax.Array,
+    detector_states: dict[str, DetectorState],
+    *,
+    config: SimulationConfig,
+    objects: ObjectContainer,
+    key: jax.Array,
+    record_detectors: bool,
+    simulate_boundaries: bool,
+    electric_conductivity: jax.Array | None = None,
+    magnetic_conductivity: jax.Array | None = None,
+) -> tuple[
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    PmlAuxField,
+    PmlAuxField,
+    jax.Array,
+    jax.Array | float,
+    dict[str, DetectorState],
+]:
+    """One forward step over the differentiable primals only, for the reversible VJP loop.
+
+    Like :func:`forward_single_args_wrapper`, but the recording state is neither an input nor an
+    output: the step never records boundaries (the reverse pass replays the record instead), so
+    keeping it out of the primals avoids materializing a full-size zero cotangent for the
+    (potentially huge) interface record on every reverse step.
+
+    Args:
+        time_step (jax.Array): Current time step.
+        E (jax.Array): Electric field.
+        H (jax.Array): Magnetic field.
+        psi_E (PmlAuxField): PML auxiliary electric fields.
+        psi_H (PmlAuxField): PML auxiliary magnetic fields.
+        inv_permittivities (jax.Array): Inverse permittivity array.
+        inv_permeabilities (jax.Array): Inverse permeability array.
+        detector_states (dict[str, DetectorState]): Detector states.
+        config (SimulationConfig): Simulation configuration.
+        objects (ObjectContainer): Simulation objects.
+        key (jax.Array): PRNG key.
+        record_detectors (bool): Whether to update detector states.
+        simulate_boundaries (bool): Whether to update the PML auxiliary fields.
+        electric_conductivity (jax.Array | None): Closure-captured electric conductivity (non-primal).
+        magnetic_conductivity (jax.Array | None): Closure-captured magnetic conductivity (non-primal).
+
+    Returns:
+        tuple: ``(time_step + 1, E, H, psi_E, psi_H, inv_permittivities, inv_permeabilities, detector_states)``.
+    """
+    arr = ArrayContainer(
+        fields=FieldState(
+            E=E,
+            H=H,
+            psi_E=psi_E,
+            psi_H=psi_H,
+        ),
+        inv_permittivities=inv_permittivities,
+        inv_permeabilities=inv_permeabilities,
+        detector_states=detector_states,
+        recording_state=None,
+        electric_conductivity=electric_conductivity,
+        magnetic_conductivity=magnetic_conductivity,
+    )
+    state = forward(
+        state=(time_step, arr),
+        config=config,
+        objects=objects,
+        key=key,
+        record_detectors=record_detectors,
+        record_boundaries=False,
+        simulate_boundaries=simulate_boundaries,
+    )
+    return (
+        state[0],
+        state[1].fields.E,
+        state[1].fields.H,
+        state[1].fields.psi_E,
+        state[1].fields.psi_H,
+        state[1].inv_permittivities,
+        state[1].inv_permeabilities,
+        state[1].detector_states,
+    )
+
+
 def forward(
     state: SimulationState,
     config: SimulationConfig,
@@ -88,6 +179,7 @@ def forward(
     record_detectors: bool,
     record_boundaries: bool,
     simulate_boundaries: bool,
+    record_time_offset: int | jax.Array = 0,
 ) -> SimulationState:
     """Performs one forward time step of the FDTD simulation.
 
@@ -110,6 +202,9 @@ def forward(
         record_detectors (bool): Whether to record detector values
         record_boundaries (bool): Whether to record boundary values for gradients
         simulate_boundaries (bool): Whether to apply PML boundary conditions
+        record_time_offset (int | jax.Array): Time step of the first entry of the recorder buffer
+            (see :func:`~fdtdx.fdtd.update.collect_interfaces`). Only used when ``record_boundaries``
+            is set. Defaults to 0.
 
     Returns:
         SimulationState: Updated simulation state for the next time step
@@ -139,6 +234,7 @@ def forward(
                 objects=objects,
                 config=config,
                 key=key,
+                record_time_offset=record_time_offset,
             )
         )
 

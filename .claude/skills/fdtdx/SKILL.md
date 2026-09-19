@@ -230,6 +230,7 @@ Distinct from manually placing PEC/PMC via `BoundaryConfig` (that still works un
 - The min-side boundary on each symmetric axis is dropped; the far (max) side keeps whatever the user set (use PML there, not periodic — the halo *behind* the symmetry plane is set by the mirror and never by wrapping to the far side, and `place_objects` warns if a periodic/Bloch boundary survives on a symmetric axis).
 - `ModePlaneSource` / `ModeOverlapDetector` solve the mode on the **mirrored full cross-section** and restrict it to the kept half (`compute_mode_symmetry_reduced`), rather than using the mode solver's own symmetric solve — the solver samples materials on its staggered grid while FDTDX writes one cell-centred ε array per component, so a symmetric solve on the reduced cross-section shifts `neff` at first order in Δ. Their mode-solver `symmetry` 2-tuple is **not** auto-derived and is ignored (with a warning) under `config.symmetry`.
 - The user must place objects symmetrically about the center plane — asymmetric models are warned about but not corrected (true of every FDTD symmetry feature).
+- Materials are rasterized per *cell*, so a structure that straddles an electric plane is symmetric under the cell flip but not under the integer-node flip that `E_x`/`E_z`/`H_y` obey; a half-domain run then matches the full domain only to first order in Δ (~1e-1 relative for a box centred on the plane, at every `curl_order`). Structures invariant along the plane normal (rods, slabs ending on a cell face) are exact mirrors.
 
 **Usage:**
 ```python
@@ -271,17 +272,73 @@ E_full = fdtdx.unfold_fields(arrays.fields.E, config.symmetry, "E")  # (3, Nx, N
 - Differentiable primals: `inv_permittivities`, `inv_permeabilities`. Conductivity arrays are closure-captured non-primals.
 - **Rejects dispersive materials** (`NotImplementedError`) — reversing the ADE polarization recurrence is under active development. Lossy (conductive) materials are supported; `num_checkpoints_reversible` bounds the reverse-reconstruction drift they cause.
 
+**Segmented reversible adjoint** (`method="reversible", recording_mode="segmented"`):
+- The classic reversible pass records the PML interface slab at *every* step, so the recorder is O(T)
+  (hundreds of GB for 10^5-step runs), which used to force lossy `LinearReconstructEveryK(k >> 1)`
+  compression. With `recording_mode="segmented"` the forward pass stores only full-field checkpoints
+  at the start of each of the `num_checkpoints_reversible + 1` segments (segment length
+  `ceil(T / (n + 1))`, tail possibly shorter) and records nothing; the backward pass re-simulates each
+  segment forward from its checkpoint to regenerate that segment's interface record, then reverses it.
+- Memory: recorder = one segment (`T/(n+1)` steps) + `n + 1` full-field checkpoints (~6 floats/cell each).
+  Cost: one extra forward sweep (~3× forward wall time instead of ~2×). The gradient is identical to the
+  full-record pass (same reverse arithmetic; tests check 1e-10 agreement in float64).
+- `place_objects` sizes the recorder to the segment length, so the gradient config must be set *before*
+  `place_objects`; `reversible_fdtd` raises if the recorder length does not match the mode.
+- Implementation (`fdtd/fdtd.py`): checkpoints are stacked along a leading axis and the segments run in
+  `lax.fori_loop`s, so the compiled program size does not grow with the number of checkpoints (the old
+  Python-unrolled per-checkpoint `lax.cond` chain is gone). `record_time_offset` on `forward`/`backward`/
+  `collect_interfaces`/`add_interfaces` indexes the segment-local buffer. The recording state is no longer
+  a primal of the per-step VJP, so no full-size zero cotangent is carried (halves peak memory of the
+  full-record mode too).
+- `num_checkpoints_reversible` alone (`recording_mode="full"`) keeps the O(T) record but resets the reverse
+  reconstruction to the exact checkpoint at every segment boundary (bounds drift for lossy media).
+
 **Checkpointed FDTD** (`method="checkpointed"`):
 - Standard gradient checkpointing via `eqxi.while_loop(kind="checkpointed")`
 - Configurable memory/compute tradeoff via `num_checkpoints`
 - Dispersive coefficients flow gradient naturally through the tape.
+- Stores full field states, so it is far more memory-hungry per step than the reversible interface record;
+  prefer the segmented reversible adjoint for long non-dispersive runs.
 
 **Setup pattern:**
 ```python
 recorder = fdtdx.Recorder(modules=[fdtdx.DtypeConversion(dtype=jnp.bfloat16)])
 gradient_config = fdtdx.GradientConfig(method="reversible", recorder=recorder)
 config = config.aset("gradient_config", gradient_config)
+
+# Long run, exact (k=1) record within a memory budget: 100 segments of T/100 steps
+gradient_config = fdtdx.GradientConfig(
+    method="reversible",
+    recorder=fdtdx.Recorder(modules=[]),
+    num_checkpoints_reversible=99,
+    recording_mode="segmented",
+)
 ```
+
+## Curl Stencil Order
+
+`SimulationConfig.curl_order ∈ {2, 4, 6, 8}` (default 2 = classic Yee). Order `2r` uses the staggered
+central stencil with `r` taps per side (`core/physics/stencil.py`: order 4 = `9/8, -1/24`):
+```
+curl_E:  dE(i) = Σ_m a_m (E[i+m] − E[i−m+1])      (integer → half)
+curl_H:  dH(i) = Σ_m a_m (H[i+m−1] − H[i−m])      (half → integer)
+```
+- **CFL**: `config.courant_number = courant_factor / (√3 · Σ|a_m|)`, i.e. the time step shrinks by `6/7` at
+  order 4 automatically; `courant_factor` keeps meaning "fraction of the stable step" at every order.
+- **Halos**: fields are padded by `r = config.curl_stencil_radius` cells before each curl
+  (`pad_fields_for_boundaries(..., width=r, field_type=...)`); everything else (detector co-location,
+  anisotropic averaging) keeps 1-cell padding.
+- **Walls at order > 2 use image halos**: a zero halo is exact at order 2 only because interior updates never
+  read it. For `r > 1`, PEC/PMC boundaries and `config.symmetry` planes fill every exterior sample with
+  `parity × mirror` about the wall plane (PEC min: plane at 0; PEC max: plane at N−1, last half-cell is
+  exterior; PMC min: plane at 1/2; PMC max: N−1/2; magnetic symmetry plane: −1/2). Bloch/periodic apply the
+  phase to all `r` ghost layers. PML keeps zero halos.
+- **Reversible adjoint**: the recorded PML interface slab is `2r − 1` cells thick
+  (`pml_interface_width(config)`, `BaseBoundary.interface_slice(width)`), so the interior reverse
+  reconstruction stays exact. The recorder grows accordingly (3× at order 4).
+- **Grid**: requires constant spacing along every axis (per-axis anisotropic uniform grids are fine;
+  stretched grids raise).
+- Order 2 is bit-identical to the previous implementation (no coefficient multiply on the `r == 1` path).
 
 ## Device & Parameter Transformations
 
@@ -424,6 +481,11 @@ assert jnp.all(jnp.isfinite(grads))
 - **Forgetting `.aset()`**: Direct attribute assignment on TreeClass objects silently fails or raises. Always use `.aset()`.
 - **Material array sizing is global**: Adding one anisotropic object forces ALL material arrays to expand. Check `ObjectContainer` isotropy properties.
 - **PML + reversible gradients**: PML breaks time-reversal. Must set up `Recorder` and `recording_state` for boundary interfaces.
+- **Reversible recorder OOM on long runs**: use `recording_mode="segmented"` with `num_checkpoints_reversible`
+  instead of `LinearReconstructEveryK(k >> 1)` (which biases the gradient). Set the gradient config before
+  `place_objects`, which sizes the recorder to one segment.
+- **`curl_order > 2` changes `dt`**: `time_steps_total` for a fixed `time` grows (7/6 at order 4). Harnesses that
+  fix the step count must read `config.time_step_duration` instead of assuming `0.99/√3 · dx / c`.
 - **Complex fields**: Bloch boundaries with nonzero k-vector automatically require complex fields. Check `config.use_complex_fields`. When complex fields are in effect, ADE polarization arrays (`dispersive_P_curr/prev`) are also allocated as complex.
 - **Conductivity scaling**: Conductivity values are multiplied by `config.resolution` during `_init_arrays()`. Don't pre-scale.
 - **Inverse storage**: Material arrays store `1/epsilon` and `1/mu`, not epsilon and mu directly. For dispersive materials, `Material.permittivity` represents ε∞ only — the full ε(ω) must be reconstructed via the dispersion model.

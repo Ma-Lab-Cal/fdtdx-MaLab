@@ -107,6 +107,110 @@ def mirror_pairs_on_plane(
     return wall == -1 and component_sits_on_plane(field_type, component, axis)
 
 
+def yee_half_cell_offset(
+    field_type: Literal["E", "H"],
+    component: int,
+    axis: int,
+) -> bool:
+    """Whether a Yee component is sampled half a cell off the integer grid along ``axis``.
+
+    With the Taflove staggering used throughout fdtdx (``E_x`` at ``(i+1/2, j, k)``, ``H_x`` at
+    ``(i, j+1/2, k+1/2)``), ``E_c`` carries the half-cell offset along ``axis`` exactly when
+    ``c == axis`` and ``H_c`` exactly when ``c != axis`` — the complement of
+    :func:`component_sits_on_plane`.
+
+    Args:
+        field_type (Literal["E", "H"]): Which field the component belongs to.
+        component (int): Component axis index (0=x, 1=y, 2=z).
+        axis (int): Axis along which the sample position is asked for.
+
+    Returns:
+        bool: True if the sample sits at ``i + 1/2``, False if it sits at ``i``.
+    """
+    return not component_sits_on_plane(field_type, component, axis)
+
+
+def fill_image_halo(
+    padded: jax.Array,
+    axis: int,
+    width: int,
+    field_type: Literal["E", "H"],
+    wall: int,
+    plane_twice: int,
+    side: Literal["-", "+"],
+    region: tuple[slice, slice, slice] | None = None,
+) -> jax.Array:
+    """Fill the samples beyond a mirror plane with the parity-weighted image of the interior.
+
+    A PEC/PMC wall (or a symmetry plane) makes the field an exact mirror image of itself across the
+    plane, with the per-component parity of :func:`field_component_parity`. The classic Yee curl
+    never reads across such a plane, so a zero halo is exact for it, but a stencil of order ``2r``
+    reads ``r`` cells past the plane and needs the image values instead.
+
+    Positions are measured in cell units along ``axis``: padded index ``p`` holds cell
+    ``i = p - width``, and component ``c`` is sampled at ``x = i + off`` with ``off = 1/2`` iff
+    :func:`yee_half_cell_offset` (else ``0``). Every sample strictly on the exterior side of the
+    plane ``P`` is overwritten by ``parity`` times the sample at ``2P - x`` — which always lands on
+    a sample of the same component. Samples exactly on the plane are left alone (their odd-parity
+    components are zeroed by the wall's post-update enforcement, the even-parity ones are their own
+    image). For the ``"+"`` side of a PEC and the ``"-"`` side of a PMC the exterior region reaches
+    half a cell into the domain, so the outermost in-domain samples of the matching components are
+    overwritten in the padded copy too.
+
+    Args:
+        padded (jax.Array): Padded field array of shape ``(3, Nx+2w, Ny+2w, Nz+2w)``.
+        axis (int): Axis the mirror plane is normal to (0=x, 1=y, 2=z).
+        width (int): Number of ghost cells per face in ``padded``.
+        field_type (Literal["E", "H"]): Whether ``padded`` holds the electric or magnetic field.
+        wall (int): ``-1`` for an electric wall (PEC), ``+1`` for a magnetic wall (PMC).
+        plane_twice (int): Twice the plane position in cell units, so that half-cell planes stay
+            integral (e.g. ``0`` for a PEC on cell 0, ``1`` for a PMC on cell 0, ``-1`` for a
+            magnetic symmetry plane half a cell below the min edge).
+        side (Literal["-", "+"]): Which side of the plane is exterior: ``"-"`` for ``x < P``
+            (the plane bounds the domain from below), ``"+"`` for ``x > P``.
+        region (tuple[slice, slice, slice] | None): Padded-index slices restricting the fill to a
+            cross-section; the entry for ``axis`` is ignored. Defaults to the in-domain cross
+            section, which is all the curl stencil of an in-domain output point ever reads.
+
+    Returns:
+        jax.Array: The padded array with the exterior samples replaced by their images.
+
+    Raises:
+        ValueError: If the domain is too thin for the image of the exterior samples to lie inside
+            it (needs at least ``width + 2`` cells along ``axis``).
+    """
+    n_total = padded.shape[axis + 1]
+    if region is None:
+        interior = [slice(width, padded.shape[a + 1] - width) for a in range(3)]
+        region = (interior[0], interior[1], interior[2])
+    for component in range(3):
+        parity = field_component_parity(field_type, component, axis, wall)
+        two_off = 1 if yee_half_cell_offset(field_type, component, axis) else 0
+        # x = p - width + off and the image of x is 2P - x, so the image of p is q - p.
+        q = plane_twice + 2 * width - two_off
+        if side == "-":
+            start, stop = 0, min((q + 1) // 2, n_total)  # p < q / 2
+        else:
+            start, stop = max(q // 2 + 1, 0), n_total  # p > q / 2
+        if stop <= start:
+            continue
+        src_start, src_stop = q - (stop - 1), q - start + 1
+        if src_start < width or src_stop > n_total - width:
+            raise ValueError(
+                f"Cannot build the image halo of a {'magnetic' if wall == 1 else 'electric'} wall on "
+                f"axis {axis}: the mirror of the {stop - start} exterior samples of component "
+                f"{component} reaches outside the domain. A curl stencil with halo width {width} "
+                f"needs at least {width + 2} cells along axis {axis}, got {n_total - 2 * width}."
+            )
+        target = list(region)
+        source = list(region)
+        target[axis] = slice(start, stop)
+        source[axis] = slice(src_start, src_stop)
+        image = jnp.flip(padded[component, *source], axis=axis)
+        padded = padded.at[component, *target].set(parity * image)
+    return padded
+
+
 def mirror_material_array(
     array: jax.Array,
     axis: int,

@@ -1,3 +1,5 @@
+from typing import Literal
+
 import jax
 from typing_extensions import override
 
@@ -66,6 +68,35 @@ class PerfectElectricConductor(BaseBoundary):
             return (0, 2)  # Ex, Ez tangential to y-face
         else:
             return (0, 1)  # Ex, Ey tangential to z-face
+
+    @override
+    def apply_pad_correction(
+        self,
+        padded_fields: jax.Array,
+        volume_shape: tuple[int, int, int],
+        resolution: float,
+        width: int = 1,
+        field_type: Literal["E", "H"] | None = None,
+    ) -> jax.Array:
+        """Fill the halo beyond the wall with the electric-wall image of the interior.
+
+        Only active for ``width > 1``: the classic Yee curl never reads a wall's halo (see
+        :meth:`~fdtdx.objects.boundaries.boundary.BaseBoundary._apply_image_halo`), so the order-2
+        path is untouched. For a ``"+"`` face the exterior reaches half a cell into the domain, so
+        the normal ``E`` and tangential ``H`` samples of the wall cell are overwritten too.
+
+        Args:
+            padded_fields: Padded field array of shape (3, Nx+2w, Ny+2w, Nz+2w)
+            volume_shape: Full simulation volume shape (Nx, Ny, Nz)
+            resolution: Grid resolution in meters
+            width: Number of ghost cells per face in ``padded_fields``
+            field_type: Whether ``padded_fields`` holds the electric or magnetic field
+
+        Returns:
+            Padded fields with the image halo written
+        """
+        del volume_shape, resolution
+        return self._apply_image_halo(padded_fields, width, field_type, wall=-1)
 
     @override
     def apply_post_E_update(self, E: jax.Array) -> jax.Array:
