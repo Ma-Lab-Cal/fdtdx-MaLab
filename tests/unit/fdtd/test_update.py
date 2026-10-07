@@ -8,7 +8,11 @@ import pytest
 
 from fdtdx.constants import eta0
 from fdtdx.core.grid import RectilinearGrid
+from fdtdx.config import SimulationConfig
+from fdtdx.core.grid import UniformGrid
 from fdtdx.fdtd.container import ArrayContainer, FieldState
+from fdtdx.objects.boundaries.pec import PerfectElectricConductor
+from fdtdx.objects.boundaries.pmc import PerfectMagneticConductor
 from fdtdx.fdtd.update import (
     add_interfaces,
     collect_interfaces,
@@ -78,6 +82,18 @@ def _make_config(c=0.5, symmetry=(0, 0, 0), curl_order=2):
     cfg.curl_order = curl_order
     cfg.curl_stencil_radius = curl_order // 2
     return cfg
+
+
+def _real_config():
+    """A genuine SimulationConfig, for the places that need to place a boundary on the grid."""
+    return SimulationConfig(
+        time=100e-15,
+        grid=UniformGrid(spacing=50e-9),
+        backend="cpu",
+        dtype=jnp.float32,
+        courant_factor=0.99,
+        gradient_config=None,
+    )
 
 
 def _diag_anisotropic_tensor(shape):
@@ -263,23 +279,32 @@ class TestMagneticSymmetryPlaneImageHalo:
 
 
 class TestPadFieldsWithSymmetryMirror:
-    """The min-side halo the detector co-location stencil reads at a symmetry plane.
+    """The min-side halo the detector co-location stencil reads at a wall.
 
-    Only an *electric* plane gets the mirror: it sits on the reduced domain's min edge, so the halo's
-    true value is the parity-weighted mirror partner (the first cell for a component sampled half a
-    cell off the plane, the second for one sampled on it). A magnetic plane sits half a cell below the
-    domain, where the zero halo already *is* the mirror, and a user-placed boundary makes no symmetry
-    claim at all — both keep the plain zero padding.
+    An *electric* wall sits on the domain's min edge, so the halo's true value is the parity-weighted
+    mirror partner (the first cell for a component sampled half a cell off the plane, the second for
+    one sampled on it). A ``config.symmetry`` electric plane is a PEC wall object and is covered by
+    exactly the same path — the parity is fixed by the wall condition, not by what is behind the
+    wall, so a user-placed PEC gets the same image. A *magnetic symmetry* plane sits half a cell
+    below the domain and carries no wall object: there the zero halo already *is* the mirror, and
+    filling it would displace the plane by half a cell.
     """
 
-    def _objects(self, axis=1, is_symmetry_wall=True):
-        boundary = Mock()
-        boundary.axis = axis
-        boundary.uses_wrap_padding = False
-        boundary._is_symmetry_wall = is_symmetry_wall
-        boundary.apply_pad_correction.side_effect = lambda padded, _shape, _spacing, **_kwargs: padded
+    def _wall(self, cls, axis=1, direction="-"):
+        shape: list[int | None] = [None, None, None]
+        shape[axis] = 1
+        boundary = cls(axis=axis, partial_grid_shape=tuple(shape), direction=direction)
+        slices = [[0, n] for n in (NX, NY, NZ)]
+        slices[axis] = [0, 1] if direction == "-" else [(NX, NY, NZ)[axis] - 1, (NX, NY, NZ)[axis]]
+        return boundary.place_on_grid(
+            grid_slice_tuple=tuple(tuple(sl) for sl in slices),
+            config=_real_config(),
+            key=jax.random.PRNGKey(0),
+        )
+
+    def _objects(self, boundaries=None):
         objects = Mock()
-        objects.boundary_objects = [boundary]
+        objects.boundary_objects = [] if boundaries is None else list(boundaries)
         objects.volume.grid_shape = (NX, NY, NZ)
         return objects
 
@@ -287,37 +312,56 @@ class TestPadFieldsWithSymmetryMirror:
         # Distinct nonzero values everywhere, so a wrong source index cannot pass by coincidence.
         return jnp.arange(1, 3 * NX * NY * NZ + 1, dtype=jnp.float32).reshape(FIELD_SHAPE)
 
-    def test_electric_plane_mirrors_each_component_with_its_own_index_map(self):
+    @pytest.mark.parametrize("symmetry", [(0, -1, 0), (0, 0, 0)])
+    def test_electric_wall_mirrors_each_component_with_its_own_index_map(self, symmetry):
+        """A symmetry plane and a user-placed PEC write the same halo — the wall fixes the parity."""
         fields = self._fields()
-        config = _make_config(symmetry=(0, -1, 0))
+        config = _make_config(symmetry=symmetry)
+        objects = self._objects([self._wall(PerfectElectricConductor)])
 
         # E across a PEC y-plane: Ex, Ez are tangential (odd) and sampled *on* the plane, so their
         # halo is minus the *second* cell; Ey is normal (even) and half a cell off, so it is plus the
         # first cell.
-        padded = pad_fields_with_symmetry_mirror(fields, self._objects(), config, "E")
+        padded = pad_fields_with_symmetry_mirror(fields, objects, config, "E")
         assert jnp.allclose(padded[0, 1:-1, 0, 1:-1], -fields[0, :, 1, :])
         assert jnp.allclose(padded[1, 1:-1, 0, 1:-1], fields[1, :, 0, :])
         assert jnp.allclose(padded[2, 1:-1, 0, 1:-1], -fields[2, :, 1, :])
 
         # H is the other way round: Hy is normal (odd) and sampled on the plane, Hx and Hz are
         # tangential (even) and half a cell off.
-        padded = pad_fields_with_symmetry_mirror(fields, self._objects(), config, "H")
+        padded = pad_fields_with_symmetry_mirror(fields, objects, config, "H")
         assert jnp.allclose(padded[0, 1:-1, 0, 1:-1], fields[0, :, 0, :])
         assert jnp.allclose(padded[1, 1:-1, 0, 1:-1], -fields[1, :, 1, :])
         assert jnp.allclose(padded[2, 1:-1, 0, 1:-1], fields[2, :, 0, :])
 
-    def test_magnetic_plane_keeps_the_zero_halo(self):
+    def test_magnetic_symmetry_plane_keeps_the_zero_halo(self):
+        """It sits half a cell out and carries no wall object, so nothing writes its halo."""
         fields = self._fields()
         config = _make_config(symmetry=(0, 1, 0))
         for field_type in ("E", "H"):
             padded = pad_fields_with_symmetry_mirror(fields, self._objects(), config, field_type)
             assert jnp.all(padded[:, :, 0, :] == 0.0), field_type
 
-    def test_user_placed_boundary_keeps_the_zero_halo(self):
+    def test_min_magnetic_wall_mirrors_across_the_cell_centre(self):
+        """A user-placed min-face PMC puts its plane at the wall cell's centre, half a cell in.
+
+        Its tangential E (even) then mirrors cell 0 onto cell 0 — i.e. the wall cell's own value,
+        which is what stops the detector halving the field there.
+        """
+        fields = self._fields()
+        config = _make_config()
+        objects = self._objects([self._wall(PerfectMagneticConductor)])
+        padded = pad_fields_with_symmetry_mirror(fields, objects, config, "E")
+        # Ex, Ez are tangential (even) and sampled below the plane: cell 0 takes cell 1's value.
+        assert jnp.allclose(padded[0, 1:-1, 1, 1:-1], fields[0, :, 1, :])
+        assert jnp.allclose(padded[2, 1:-1, 1, 1:-1], fields[2, :, 1, :])
+        # Ey is normal (odd) and sits exactly on the plane, so it is left alone.
+        assert jnp.allclose(padded[1, 1:-1, 1, 1:-1], fields[1, :, 0, :])
+
+    def test_no_boundary_keeps_the_zero_halo(self):
         fields = self._fields()
         config = _make_config(symmetry=(0, -1, 0))
-        objects = self._objects(is_symmetry_wall=False)
-        padded = pad_fields_with_symmetry_mirror(fields, objects, config, "E")
+        padded = pad_fields_with_symmetry_mirror(fields, self._objects(), config, "E")
         assert jnp.all(padded[:, :, 0, :] == 0.0)
 
 

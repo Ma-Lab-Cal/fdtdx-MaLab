@@ -80,10 +80,10 @@ class PerfectElectricConductor(BaseBoundary):
     ) -> jax.Array:
         """Fill the halo beyond the wall with the electric-wall image of the interior.
 
-        Only active for ``width > 1``: the classic Yee curl never reads a wall's halo (see
-        :meth:`~fdtdx.objects.boundaries.boundary.BaseBoundary._apply_image_halo`), so the order-2
-        path is untouched. For a ``"+"`` face the exterior reaches half a cell into the domain, so
-        the normal ``E`` and tangential ``H`` samples of the wall cell are overwritten too.
+        The plane sits on the tangential-``E`` node row at the lower edge of the wall cell, so for a
+        ``"+"`` face the exterior reaches half a cell into the domain and the normal ``E`` and
+        tangential ``H`` samples of the wall cell are overwritten too (see
+        :meth:`~fdtdx.objects.boundaries.boundary.BaseBoundary._apply_image_halo`).
 
         Args:
             padded_fields: Padded field array of shape (3, Nx+2w, Ny+2w, Nz+2w)
@@ -97,6 +97,19 @@ class PerfectElectricConductor(BaseBoundary):
         """
         del volume_shape, resolution
         return self._apply_image_halo(padded_fields, width, field_type, wall=-1)
+
+    @property
+    @override
+    def exterior_cell_range(self) -> tuple[int, int] | None:
+        """The wall cell of a ``"+"`` face, whose upper half lies outside the electric plane.
+
+        The plane is the tangential-``E`` node row at the cell's lower edge, so on a ``"+"`` face
+        ``Ez``, ``Hx`` and ``Hy`` of that cell sit half a cell past it and ``Ex``, ``Ey``, ``Hz``
+        sit exactly on it, where the wall zeroes them. A ``"-"`` face keeps its whole wall cell.
+        """
+        if self.direction != "+":
+            return None
+        return self._grid_slice_tuple[self.axis]
 
     @override
     def apply_post_E_update(self, E: jax.Array) -> jax.Array:

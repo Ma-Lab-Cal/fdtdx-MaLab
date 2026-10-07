@@ -1,9 +1,13 @@
 """Unit tests for the image (mirror-with-parity) halos of PEC/PMC walls and the Bloch phase halo.
 
-At order 2 the curl never reads a wall's halo, so a zero halo is exact and PEC/PMC leave the
-padding alone. From order 4 on, the stencil reaches ``r`` cells past the wall plane and the halo
-must carry the parity-weighted mirror image of the interior. These tests check that image against
-an independently written index formula, for both wall types, both faces and both fields.
+A wall makes the field an exact mirror of itself, so the halo beyond it must carry the
+parity-weighted image of the interior. That image is written at every halo width, including the
+classic Yee scheme's width 1 — at width 1 the samples it changes are ones the curl either never
+reads or that the wall zeroes immediately afterwards, *except* on the two faces whose wall cell is
+half outside the plane (see ``test_pec_plus_face_...`` / ``test_pmc_minus_face_...``), where writing
+the image is what stops those samples decoupling into a spurious closed subsystem. These tests check
+the image against an independently written index formula, for both wall types, both faces, both
+fields and both widths.
 """
 
 import jax
@@ -109,8 +113,8 @@ class TestPecPmcImageHalo:
     @pytest.mark.parametrize("cls,wall,direction", WALLS)
     @pytest.mark.parametrize("axis", [0, 1, 2])
     @pytest.mark.parametrize("field_type", ["E", "H"])
-    def test_matches_reference_image(self, config, cls, wall, direction, axis, field_type):
-        width = 2
+    @pytest.mark.parametrize("width", [1, 2])
+    def test_matches_reference_image(self, config, cls, wall, direction, axis, field_type, width):
         boundary = _place(_make_wall(cls, axis, direction), config)
         _, padded = _random_padded(width)
         got = boundary.apply_pad_correction(padded, VOLUME, SPACING, width=width, field_type=field_type)
@@ -126,22 +130,14 @@ class TestPecPmcImageHalo:
         assert not np.allclose(np.array(got)[sub], np.array(padded)[sub])  # something was written
 
     @pytest.mark.parametrize("cls,wall,direction", WALLS)
-    @pytest.mark.parametrize("field_type", ["E", "H"])
-    def test_width_one_is_a_noop(self, config, cls, wall, direction, field_type):
-        boundary = _place(_make_wall(cls, 1, direction), config)
-        _, padded = _random_padded(1)
-        got = boundary.apply_pad_correction(padded, VOLUME, SPACING, width=1, field_type=field_type)
-        assert jnp.array_equal(got, padded)
-
-    @pytest.mark.parametrize("cls,wall,direction", WALLS)
     def test_without_field_type_is_a_noop(self, config, cls, wall, direction):
         boundary = _place(_make_wall(cls, 2, direction), config)
         _, padded = _random_padded(2)
         assert jnp.array_equal(boundary.apply_pad_correction(padded, VOLUME, SPACING, width=2), padded)
 
-    def test_interior_is_untouched_except_the_wall_cell_half_samples(self, config):
+    @pytest.mark.parametrize("width", [1, 2])
+    def test_interior_is_untouched_except_the_wall_cell_half_samples(self, config, width):
         """A PEC on the min face only rewrites the ghost cells, never the domain."""
-        width = 2
         boundary = _place(_make_wall(PerfectElectricConductor, 0, "-"), config)
         field, padded = _random_padded(width)
         got = boundary.apply_pad_correction(padded, VOLUME, SPACING, width=width, field_type="E")
@@ -189,6 +185,24 @@ class TestPecPmcImageHalo:
             for component in range(3):
                 parity = field_component_parity(field_type, component, 0, wall)
                 assert jnp.allclose(got[component, ghosts][(slice(None), *cross)], float(parity))
+
+
+class TestExteriorCellRange:
+    """Only the two half-open faces report a dead cell; the other four report none."""
+
+    @pytest.mark.parametrize("cls,wall,direction", WALLS)
+    def test_only_the_half_open_faces_have_a_dead_cell(self, config, cls, wall, direction):
+        axis = 2
+        boundary = _place(_make_wall(cls, axis, direction), config)
+        dead = boundary.exterior_cell_range
+        half_open = (cls is PerfectMagneticConductor and direction == "-") or (
+            cls is PerfectElectricConductor and direction == "+"
+        )
+        if not half_open:
+            assert dead is None
+        else:
+            assert dead == boundary.grid_slice_tuple[axis]
+            assert dead[1] - dead[0] == 1
 
 
 class TestBlochPhaseHalo:

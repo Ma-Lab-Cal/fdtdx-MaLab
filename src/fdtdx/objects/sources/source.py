@@ -38,6 +38,53 @@ class Source(SimulationObject, ABC):
     _is_on_at_time_step_arr: jax.Array = private_field()
     _time_step_to_on_idx: jax.Array = private_field()
 
+    def validate_placement(self, objects) -> list[str]:
+        """Reject a source that sits entirely in the dead half-cell of a PEC/PMC wall.
+
+        A wall plane is a node row inside its cell, so on one of its two faces (a ``"-"`` magnetic
+        wall, a ``"+"`` electric one) the outer half of the wall cell lies outside the modelled
+        domain: every Yee sample there is either a mirror of an interior sample or is driven to zero
+        on the plane (see
+        :meth:`~fdtdx.objects.boundaries.boundary.BaseBoundary.exterior_cell_range`). A source whose
+        whole footprint falls in those cells therefore radiates nothing — it is overwritten by the
+        image halo before the curl ever sees it — while the simulation runs to completion, stays
+        finite and reports no error. This turns that into an error at placement time.
+
+        Args:
+            objects (ObjectContainer): The fully-resolved container of all placed objects.
+
+        Returns:
+            list[str]: Error messages describing invalid placement, or ``[]``.
+        """
+        errors = list(super().validate_placement(objects))
+        own = self.grid_slice_tuple
+        for boundary in objects.boundary_objects:
+            dead = boundary.exterior_cell_range
+            if dead is None:
+                continue
+            axis = boundary.axis
+            if not (dead[0] <= own[axis][0] and own[axis][1] <= dead[1]):
+                continue  # the source reaches into the domain proper
+            other = [a for a in range(3) if a != axis]
+            if any(
+                own[a][1] <= boundary.grid_slice_tuple[a][0] or boundary.grid_slice_tuple[a][1] <= own[a][0]
+                for a in other
+            ):
+                continue  # no overlap in the plane of the wall
+            # Only a "-" magnetic and a "+" electric wall have a dead cell, so the face fixes the
+            # wall type and the direction the source has to move to get back into the domain.
+            wall_kind = "magnetic" if boundary.direction == "-" else "electric"
+            inward = "+1" if boundary.direction == "-" else "-1"
+            errors.append(
+                f"Source '{self.name}' lies entirely inside the wall cell of the {wall_kind} boundary "
+                f"'{boundary.name}' ({'xyz'[axis]} axis, '{boundary.direction}' face), cells "
+                f"{dead[0]}:{dead[1]}. The wall plane cuts that cell in half and the source's side of "
+                f"it is outside the simulated domain, so the source cannot drive any field: its "
+                f"samples are either overwritten by the wall's mirror image or held at zero on the "
+                f"plane. Move the source {inward} cell along {'xyz'[axis]}, or drop the wall."
+            )
+        return errors
+
     def is_on_at_time_step(self, time_step: jax.Array) -> jax.Array:
         return self._is_on_at_time_step_arr[time_step]
 

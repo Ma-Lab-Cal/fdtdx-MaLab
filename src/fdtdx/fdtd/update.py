@@ -7,7 +7,7 @@ from fdtdx.config import SimulationConfig
 from fdtdx.constants import eta0
 from fdtdx.core.misc import expand_to_3x3, pad_fields
 from fdtdx.core.physics.curl import curl_E, curl_H, interpolate_fields
-from fdtdx.core.physics.symmetry import field_component_parity, fill_image_halo, mirror_pairs_on_plane
+from fdtdx.core.physics.symmetry import fill_image_halo
 from fdtdx.core.switch import OnOffSwitch
 from fdtdx.fdtd.container import ArrayContainer, ObjectContainer
 from fdtdx.fdtd.misc import (
@@ -171,28 +171,28 @@ def pad_fields_with_symmetry_mirror(
     config: SimulationConfig,
     field_type: Literal["E", "H"],
 ) -> jax.Array:
-    """Pad fields, filling the halo of every *electric* ``config.symmetry`` plane with its mirror.
+    """Pad fields, filling the halo of every wall and symmetry plane with its parity image.
 
     This exists for the detector co-location stencil of
-    :func:`~fdtdx.core.physics.curl.interpolate_fields`, which is the only consumer of the min-side
-    halo that a symmetry plane can get wrong. That stencil takes a backward half-step average, so for
-    a detector touching the plane it averages the first cell against the halo — and
-    :func:`pad_fields_for_boundaries` puts a zero there, where the true neighbour is the mirror image
-    of the interior. The detector then records exactly *half* the field in the plane row. Each
-    component instead takes the parity-weighted value of its own mirror partner: the neighbouring
-    cell for components sampled half a cell off the plane, the next one in for components sampled on
-    it.
+    :func:`~fdtdx.core.physics.curl.interpolate_fields`, which is the only consumer of a wall's halo
+    that can get it wrong. That stencil takes a backward half-step average, so for a detector
+    touching a wall it averages the first cell against the halo — and a *zero* halo there makes the
+    detector record exactly **half** the field in the wall row. The true neighbour is the parity
+    image of the interior, which is a property of the wall condition (tangential ``E`` odd and normal
+    ``E`` even across an electric wall, and the dual across a magnetic one), not of whatever is
+    behind the wall: a real PEC terminating a domain constrains the field exactly as a mirror plane
+    does. Every wall therefore gets its image, symmetry plane or user-placed alike, which is what
+    :func:`pad_fields_for_boundaries` already writes once it is told which field it is padding.
 
-    The field updates do **not** use this: the halo along an axis is only read by the updates of the
+    The field updates do **not** need this: the halo along an axis is only read by the updates of the
     components tangential to it (an update never differentiates along its own component axis), and on
     an electric plane those are precisely the components the PEC wall zeroes right afterwards, so the
     halo value cannot survive.
 
-    Only **electric** symmetry planes get the mirror. A magnetic plane sits half a cell below the
-    reduced domain, so the zero halo already *is* its exact mirror (tangential ``H`` vanishes there);
-    filling it would displace the plane by half a cell. See
-    :func:`~fdtdx.fdtd.symmetry.make_symmetry_walls`. A user-placed PEC/PMC boundary makes no
-    symmetry claim about the structure behind it either, so its halo also stays as it was.
+    A **magnetic symmetry** plane still gets nothing, and correctly so: it sits half a cell below the
+    reduced domain, so the zero halo already *is* its exact mirror (tangential ``H`` vanishes there)
+    and filling it would displace the plane by half a cell. It carries no wall object for the same
+    reason — see :func:`~fdtdx.fdtd.symmetry.make_symmetry_walls`.
 
     Args:
         fields: Field array of shape (3, Nx, Ny, Nz)
@@ -203,28 +203,7 @@ def pad_fields_with_symmetry_mirror(
     Returns:
         Padded fields of shape (3, Nx+2, Ny+2, Nz+2)
     """
-    padded = pad_fields_for_boundaries(fields, objects, config)
-    for boundary in objects.boundary_objects:
-        if not getattr(boundary, "_is_symmetry_wall", False):
-            continue
-        axis = boundary.axis
-        wall = config.symmetry[axis]
-        if wall != -1:
-            # Unreachable today (only electric planes get a wall object), but the mirror is wrong for
-            # a magnetic plane, so state the restriction here rather than inherit it by accident.
-            continue
-        for component in range(3):
-            parity = field_component_parity(field_type, component, axis, wall)
-            # Padded index 0 is one cell below the domain. Its mirror partner is the domain's first
-            # cell for a half-cell-offset component (padded index 1) and the second one for a
-            # component sampled on the plane itself (padded index 2).
-            source_index = 2 if mirror_pairs_on_plane(field_type, component, axis, wall) else 1
-            target: list[slice] = [slice(None)] * 3
-            source: list[slice] = [slice(None)] * 3
-            target[axis] = slice(0, 1)
-            source[axis] = slice(source_index, source_index + 1)
-            padded = padded.at[component, *target].set(parity * padded[component, *source])
-    return padded
+    return pad_fields_for_boundaries(fields, objects, config, field_type=field_type)
 
 
 def get_anisotropic_averaging_widths(

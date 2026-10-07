@@ -114,6 +114,50 @@ def _check_curl_order_grid(config: SimulationConfig) -> None:
         )
 
 
+def _check_curl_order_boundaries(config: SimulationConfig, objects: ObjectContainer) -> None:
+    """Raise if a higher-order curl stencil is combined with an unterminated outer face.
+
+    With no boundary object on a face the padding is a plain zero halo. The classic Yee curl only
+    ever reads the min-face ``H`` ghosts and the max-face ``E`` ghosts, and a zero halo there is an
+    exact mirror condition (a magnetic wall half a cell below the min edge, an electric one half a
+    cell above the max edge), so an open face is a legitimate — if implicit — way to close an
+    order-2 domain. From ``curl_order = 4`` on, the stencil reaches ``r`` cells past the face and a
+    zero halo is no longer that mirror, nor anything else physical: the run completes and stays
+    finite while quietly solving a different problem. Declare the face instead (a PML, a
+    ``pec``/``pmc`` wall, a periodic pair, or ``config.symmetry`` on that axis).
+
+    Args:
+        config (SimulationConfig): Simulation configuration (provides ``curl_order``, ``symmetry``).
+        objects (ObjectContainer): The fully-resolved object container.
+
+    Raises:
+        ValueError: If ``config.curl_order > 2`` and some outer face carries no boundary.
+    """
+    if config.curl_order <= 2:
+        return
+    # A zero-thickness boundary (``thickness_grid_* = 0`` on a PML face) is an object that covers no
+    # cell and applies no correction, so it terminates nothing.
+    covered = {(b.axis, b.direction) for b in objects.boundary_objects if b.grid_shape[b.axis] > 0}
+    open_faces = [
+        f"{'min' if direction == '-' else 'max'}_{'xyz'[axis]}"
+        for axis in range(3)
+        for direction in ("-", "+")
+        # A magnetic symmetry plane deliberately carries no wall object: its image halo is written
+        # by pad_fields_for_boundaries, so that min face is terminated even though nothing covers it.
+        if (axis, direction) not in covered and not (direction == "-" and config.symmetry[axis] != 0)
+    ]
+    if open_faces:
+        raise ValueError(
+            f"config.curl_order={config.curl_order} requires every outer face to be terminated, but "
+            f"{', '.join(open_faces)} carries no boundary of nonzero thickness. At order 2 an open "
+            f"face is an implicit "
+            f"mirror (the zero halo the curl reads is exact); a wider stencil reads past it, where "
+            f"the zero halo means nothing physical. Add a PML, a pec/pmc wall or a periodic "
+            f"boundary on {'these faces' if len(open_faces) > 1 else 'that face'}, set "
+            f"config.symmetry on the axis, or use curl_order=2."
+        )
+
+
 def place_objects(
     object_list: Sequence[SimulationObject],
     config: SimulationConfig,
@@ -289,6 +333,8 @@ def place_objects(
             f"  - {name}:\n" + "\n".join(f"      * {msg}" for msg in msgs) for name, msgs in placement_errors.items()
         )
         raise ValueError(f"Invalid object placement:\n{formatted}")
+
+    _check_curl_order_boundaries(config, objects_container)
 
     # Step 10: Initialize parameters and arrays
     assert key is not None

@@ -84,6 +84,23 @@ class BaseBoundary(SimulationObject, ABC):
         del volume_shape, resolution, width, field_type
         return padded_fields
 
+    @property
+    def exterior_cell_range(self) -> tuple[int, int] | None:
+        """Cells along :attr:`axis` in which every Yee sample lies outside the modelled domain.
+
+        A wall plane is a *node* row, not a cell edge, so on one of its two faces the plane cuts the
+        wall cell in half and the outer half is not part of the simulated region. Every sample of
+        such a cell is then either strictly outside the plane (and therefore just a mirror of an
+        interior sample, written by :meth:`_apply_image_halo`) or sits exactly on the plane, where
+        the wall drives it to zero. Nothing placed there — a source, a design voxel — can influence
+        the field, and nothing read there is an independent result.
+
+        Returns:
+            tuple[int, int] | None: ``(start, stop)`` grid bounds of the dead cells, or ``None`` when
+            this boundary has none (the default; PML, Bloch and the two well-behaved wall faces).
+        """
+        return None
+
     def _padded_cross_section(self, width: int) -> tuple[slice, slice, slice]:
         """Padded-index slices of this boundary's footprint on the axes it does not terminate.
 
@@ -116,12 +133,23 @@ class BaseBoundary(SimulationObject, ABC):
     ) -> jax.Array:
         """Write the mirror image of the interior into the samples outside this wall.
 
-        A no-op for ``width <= 1``: the classic Yee curl never reads the halo of a wall (only the
-        tangential components the wall zeroes right afterwards do), so the zero halo is exact there
-        and leaving it untouched keeps the order-2 path bit-identical.
-
         The plane is the node the wall drives to zero: the tangential-E node at the lower edge of
         the wall cell for an electric wall, the tangential-H node at its centre for a magnetic one.
+
+        This runs at every ``width``, including the classic Yee scheme's ``width = 1``. At width 1
+        the halo the curl actually reads (the min-face ``H`` ghosts and the max-face ``E`` ghosts;
+        the staggered differences never touch the other two) only ever feeds components the wall
+        zeroes immediately afterwards, so for a ``"-"`` electric and a ``"+"`` magnetic wall the
+        image and the zero halo are indistinguishable. For the other two faces it is *not* a no-op,
+        and the difference is a bug fix rather than a refinement: a ``"-"`` magnetic and a ``"+"``
+        electric wall leave half of their wall cell outside the plane
+        (see :meth:`exterior_cell_range`), and with a zero halo those exterior samples decouple from
+        the domain entirely — at a min-face PMC, ``Ex``, ``Ey`` and ``Hz`` of cell 0 form a closed
+        2D system that no interior field drives and that drives no interior field, yet still reports
+        plausible values into any full-volume detector or energy integral. Filling the image instead
+        makes them carry the mirror of the first interior cell, which is what they represent, and
+        leaves every interior sample bit-identical (the overwritten samples only ever feed each
+        other).
 
         Args:
             padded_fields (jax.Array): Padded field array of shape ``(3, Nx+2w, Ny+2w, Nz+2w)``.
@@ -132,7 +160,7 @@ class BaseBoundary(SimulationObject, ABC):
         Returns:
             jax.Array: The padded array with the exterior samples replaced by their images.
         """
-        if width <= 1 or field_type is None:
+        if field_type is None:
             return padded_fields
         lo, hi = self._grid_slice_tuple[self.axis]
         # "-" terminates the domain from below, so the wall cell is the slab's last one.

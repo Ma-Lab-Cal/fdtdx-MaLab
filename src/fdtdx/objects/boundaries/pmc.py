@@ -72,11 +72,10 @@ class PerfectMagneticConductor(BaseBoundary):
     ) -> jax.Array:
         """Fill the halo beyond the wall with the magnetic-wall image of the interior.
 
-        Only active for ``width > 1``: the classic Yee curl never reads a wall's halo (see
-        :meth:`~fdtdx.objects.boundaries.boundary.BaseBoundary._apply_image_halo`), so the order-2
-        path is untouched. The plane sits on the tangential-``H`` node at the centre of the wall
-        cell, so for a ``"-"`` face the exterior reaches half a cell into the domain and the
-        tangential ``E`` and normal ``H`` samples of the wall cell are overwritten too.
+        The plane sits on the tangential-``H`` node at the centre of the wall cell, so for a ``"-"``
+        face the exterior reaches half a cell into the domain and the tangential ``E`` and normal
+        ``H`` samples of the wall cell are overwritten too (see
+        :meth:`~fdtdx.objects.boundaries.boundary.BaseBoundary._apply_image_halo`).
 
         Args:
             padded_fields: Padded field array of shape (3, Nx+2w, Ny+2w, Nz+2w)
@@ -90,6 +89,20 @@ class PerfectMagneticConductor(BaseBoundary):
         """
         del volume_shape, resolution
         return self._apply_image_halo(padded_fields, width, field_type, wall=1)
+
+    @property
+    @override
+    def exterior_cell_range(self) -> tuple[int, int] | None:
+        """The wall cell of a ``"-"`` face, whose lower half lies outside the magnetic plane.
+
+        The plane is the tangential-``H`` node at the cell's centre, so on a ``"-"`` face ``Ex``,
+        ``Ey`` and ``Hz`` of that cell sit half a cell below it and ``Ez``, ``Hx``, ``Hy`` sit
+        exactly on it, where a magnetic wall drives them to zero. A ``"+"`` face keeps its whole
+        wall cell.
+        """
+        if self.direction != "-":
+            return None
+        return self._grid_slice_tuple[self.axis]
 
     @override
     def apply_post_H_update(self, H: jax.Array) -> jax.Array:
